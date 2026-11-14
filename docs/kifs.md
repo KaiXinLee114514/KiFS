@@ -100,8 +100,8 @@ Record 表放在块 1 之后固定区域：`record_start` 起，槽号即 OID。
 |---:|---:|---|---|
 | 0 | 4 | `oid` | 自身 OID（冗余校验，应等于槽号） |
 | 4 | 1 | `type` | 1=file，2=dir，3=symlink（预留） |
-| 5 | 1 | `flags` | 0x01=hide，0x02=readonly，0x04=system |
-| 6 | 2 | `perm` | 9 位 rwxrwxrwx（owner/group/other），高位预留 |
+| 5 | 1 | `flags` | 0x01=system，其余预留（hide/ro/iolock 统一放 `perm` 里） |
+| 6 | 2 | `perm` | 16 位权限/属性字：bit0-8 = `rwxrwxrwx`，bit9 = hide，bit10 = ro，bit11 = iolock，bit12-15 预留 |
 | 8 | 4 | `size` | 文件字节数 |
 | 12 | 4 | `blocks` | 实际占用数据块数 |
 | 16 | 4 | `parent` | 父目录 OID（根为 0） |
@@ -115,7 +115,8 @@ Record 表放在块 1 之后固定区域：`record_start` 起，槽号即 OID。
 | 72 | 4 | `ext_index` | 超出内联的 extent 表所在块号（0=无） |
 | 76 | 4 | `n_ext_total` | extent 总数 |
 | 80 | 4 | `next_free_oid` | 预留（链式扩展用） |
-| 84 | 44 | `reserved` | 填 0 |
+| 84 | 16 | `owner` | 所有者用户名（UTF-8，NUL 填充，最多 15 字符；v1 单用户也记录） |
+| 100 | 28 | `reserved` | 填 0 |
 
 - 内联上限 92 B（v1），≤92 B 的文件直接躺在 record 里。
 - 文件 > 92 B：用 extent 段；≤3 段全部内联，更多则 `ext_index` 指向数据区里的一张
@@ -181,16 +182,37 @@ Record 表放在块 1 之后固定区域：`record_start` 起，槽号即 OID。
 
 ---
 
-## 9. 权限与属性
+## 9. 权限与属性（`rwxrwxrwx-hide-ro-iolock-owner`）
 
-- `perm`：9 位，`rwx` 三段。v1 无用户系统，权限仅 honor：
-  - 非 `owner` 的访问不检查（单用户）；
-  - `ro` 文件被写 → 返回 `EACCES`。
-- `flags`：`hide`（ls 默认不列，`ls -a` 可见）、`readonly`、`system`。
-- **iolock**：运行期每文件一个锁（KKernel 单进程写，先占位）。
-- **cache 组**：运行期 RAM 缓存，不落盘：
-  - 数据缓存 200 块 + 元数据缓存 50 块（待定），LRU 替换；
-  - 作用类似 FAT16 的 `FAT_BUF`/`fat_cache_lba`，但按块管理。
+权限字 `perm` 是 16 位，布局：
+
+| 位 | 字段 | 说明 |
+|---:|---|---|
+| bit0-2 | `rwx`（owner） | 所有者读/写/执行 |
+| bit3-5 | `rwx`（group） | 同组读/写/执行（v1 预留） |
+| bit6-8 | `rwx`（other） | 其他读/写/执行 |
+| bit9 | `hide` | ls 默认不列，`ls -a` 可见 |
+| bit10 | `ro` | 只读：写/删/改名返回 `EACCES` |
+| bit11 | `iolock` | 被锁：运行期独占标记（见下） |
+| bit12-15 | 预留 | 填 0 |
+
+配合 Record 里的 `owner`（16 B 用户名，如 `kai`），完整展示格式：
+
+```
+rwxrwxrwx-hide-ro-iolock-owner:kai
+```
+
+（未置位的项也照样打印，方便 `ls -l` 一眼对齐；`iolock` 是运行期状态位）
+
+语义：
+- **hide**：默认目录列表不显示；显式路径访问仍然可以。
+- **ro**：只读；v1 无用户系统也会 honor（写 → `EACCES`）。
+- **iolock**：每文件一个锁位。打开/写入时置位，关闭时清位；掉电遗留的 iolock
+  由 fsck 清掉。v1 单进程写，主要用于将来多 shell / 多线程并发时的互斥，
+  以及 `ls -l` 展示「这个文件正被占用」。
+- 非 owner 的访问检查 v1 不做（单用户），但字段先留好。
+- **cache 组**（运行期 RAM，不落盘）：数据缓存 200 块 + 元数据缓存 50 块（待定），
+  LRU 替换；类似 FAT16 的 `FAT_BUF`/`fat_cache_lba`，但按块管理。
 
 ---
 
@@ -249,6 +271,8 @@ Record 表放在块 1 之后固定区域：`record_start` 起，槽号即 OID。
 | 版本 | `0x0001_0000` |
 | 块大小 | 4096 |
 | record 大小 | 128 |
+| perm 字 | 16 位：rwxrwxrwx + hide + ro + iolock |
+| owner | 16 B 用户名（UTF-8，NUL 填充） |
 | 内联上限 | 92 B |
 | 内联 extent 上限 | 3 个 |
 | 目录项头 | 8 B，名字 UTF-8，4 对齐 |
@@ -267,3 +291,5 @@ Record 表放在块 1 之后固定区域：`record_start` 起，槽号即 OID。
 5. keywords 删除/更新的空间回收
 6. KiFS 与 FAT16 的挂载原语（`mount` 命令 + VFS 层抽象）
 7. 断电测试怎么做：QEMU `-snapshot` + 杀进程 + 重新挂载 fsck
+8. owner 直存用户名（v1）vs 以后改 uid 表（需要用户系统）
+9. group/other 的 rwx 在单用户 v1 是否只展示不强制（倾向只展示）
