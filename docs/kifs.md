@@ -158,29 +158,36 @@ Record 表放在块 1 之后固定区域：`record_start` 起，槽号即 OID。
 
 ## 8. Journal（redo，盘尾固定预留）
 
-- 预留 `journal_blocks`（默认 64 块 = 256 KiB），环形。
-- 块头（每块开头 12 B）：`magic 'KJRN' (4) + seq u32 (4) + flags u16 (2) + count u16 (2)`。
-- 记录（可变长、按 4 对齐）：
+- 预留 `journal_blocks`（默认 64 块 = 256 KiB），环形；块号 `journal_start + i`。
+- **一个 journal 块承载一条记录**（简化：逐块 CRC、易做断电注入）：
 
-| 字段 | 大小 | 说明 |
-|---|---:|---|
-| `type` | 1 | 1=BEGIN，2=BLOCK，3=COMMIT |
-| `len` | 2 | 负载长度 |
-| `target_block` | 4 | 要写的块号（BLOCK） |
-| `offset` | 2 | 块内偏移 |
-| `data_blocks` | 2 | （运行期）负载占几块 |
-| `payload` | … | 要写的字节 |
+| 偏移 | 大小 | 字段 | 说明 |
+|---:|---:|---|---|
+| 0 | 4 | `magic` | `'KJRN'` |
+| 4 | 4 | `seq` | 事务序号，单调递增 |
+| 8 | 2 | `flags` | bit0 VALID，bit1 BEGIN，bit2 COMMIT，bit3 END |
+| 10 | 2 | `offset` | 数据片在目标块内偏移（BEGIN/COMMIT/END 为 0） |
+| 12 | 4 | `target_block` | 目标块号（BEGIN/COMMIT/END 为 0） |
+| 16 | 2 | `len` | payload 长度（≤ 4076） |
+| 18 | 2 | `crc16` | CRC-16/CCITT（poly 0x1021，init 0xFFFF）覆盖 payload |
+| 20 | 4076 | `payload` | 数据片 |
 
-- 协议：
-  1. 写 BEGIN（带事务 seq）
-  2. 写所有 BLOCK 记录（含要落盘的数据/元数据块内容）
-  3. 写 COMMIT
-  4. 真正写目标块
-  5. 写 END / 更新 head 游标
-- 挂载时：从头扫，若发现完整 BEGIN…COMMIT 段 → 重放（目标块写回）；不完整段丢弃。
-- 副作用：v1 每次写文件至少多写一遍 journal；速度换安全，后续可选 `barrier=0` 关闭。
-
----
+- 大块拆分：一个目标块/连续区间的数据按 4076 B 切片，逐片记录（同 seq、同 target、offset 递增）；恢复时按 (target, offset) 排序应用。
+- 事务协议：
+  1. `BEGIN(seq)` 写一个 journal 块
+  2. 逐条写数据片记录（看情况 1~N 块）
+  3. `COMMIT(seq)` 写一个 journal 块
+  4. **应用**：按记录把数据写回目标块（顺序无关，重放幂等）
+  5. `END(seq)`：覆盖写回 BEGIN 那个 journal 槽（flags=VALID|END），表示已应用完成
+- 打开镜像/挂载时：扫全部 journal 块 → 按 seq 聚合；**只有 BEGIN+COMMIT 完整、且所有数据片 CRC16 有效的事务才重放**；不完整/撕裂事务直接丢弃。
+  - 「已应用但没写 END」时崩溃 → 下次打开再应用同样内容，幂等无害。
+  - 「只有 COMMIT 没有 END」的完整事务一律重放（幂等），保证崩溃恢复不需要额外 checkpoint 指针。
+- **CoW 写路径（v1）**：
+  - 文件数据块不原地改：分配新块、写完新数据后才提交元数据事务；旧块在事务里从位图释放。
+  - 元数据只走 journal 增量：Record 128 B、位图变化的字节、Superblock 112 B（主+块 2+末块备份）。
+  - 因此断电时：新数据块 = 孤儿（位图未标、fsck 回收）；旧数据/旧元数据始终完整。
+- 断电注入（宿主原型）：`KIFS_CRASH=after_begin|after_records|after_commit|after_apply|torn` 在对应阶段直接退出/写坏记录，验证恢复。
+- 副作用：每次写至少多写 2+ 个 journal 块；速度换安全，后续可加 `barrier=0`。
 
 ## 9. 权限与属性（`rwxrwxrwx-hide-ro-iolock-owner`）
 
@@ -258,6 +265,7 @@ rwxrwxrwx111kai
 
 - **Phase A（宿主原型，不碰内核）**：`tools/mkifs.py`
   - format / mkdir / write / read / ls / 小文件内联 / extent 分配 / fsck
+  - **A2（已完成，2026-11-15）**：journal redo + CoW 写入路径 + 断电注入自测（`tools/test_journal.py` 29 项：BEGIN/records/COMMIT/apply/torn 五个注入点 → 重开恢复后内容与 fsck 均一致）；未提交事务在挂载时自动回收槽位（写 END）
   - Python 单文件，输出 4 MiB 测试镜像；与设计表逐字节对齐
 - **Phase B（内核只读）**：`kernel/kifs.asm`
   - **B0（已完成，2026-11-14）**：KKernel 里的只读驱动 + `kifs` 命令组 —— `kifs info` / `ls [路径]` / `cat <路径>` / `stat <路径>`；superblock 校验（魔数 / 版本 / CRC32）、目录项逐段遍历、内联 + extent 读取。**固定 LBA 22528**、只读、不挂 VFS；宿主 `mkifs.py` 造的镜像 dd 到 16 MB 盘 FAT16 分区之后自测（`make test-kifs`，12 项屏幕断言）
@@ -310,3 +318,14 @@ rwxrwxrwx111kai
 - **MVP 限制**：目录内容 ≤ 4 KiB（每层目录单块缓冲）；`cat` 单文件 ≤ 60 KiB（按块流式读，不整文件进内存）。
 - **内联 record 的 36..128 字节被内联数据覆盖**（v0 宿主实现行为）：所以 `inline_len > 0` 时不要解析 extent 区 / owner 字段。
 - **静默失败**：盘上没 KiFS 卷（魔数 / CRC 不对、读盘失败）时 `kifs_init` 直接返回，不影响原有 FAT / 软盘启动路径。
+
+---
+
+## 16. 实现记录：Phase A2（journal redo + CoW，2026-11-15）
+
+- **代码**：`tools/mkifs.py`（`Image.recover` / `Image.flush` / `Image._jrn_commit` / `mark` / `mark_span` / `write_data_block`），`tools/test_journal.py`。
+- **写路径**：所有元数据变更（Record 128 B、位图字节、Superblock ×3）先进 `_txn_deltas`；`flush()` 摊平成 journal 记录并提交；数据块（文件/目录内容）永远写新块（CoW），旧块在事务内释放——提交前新块是孤儿，fsck 会认为未用。
+- **恢复**：挂载即 `recover()`；重放 BEGIN+COMMIT 完整且 CRC 全有效的事务（幂等，再写 END 覆盖 BEGIN 槽）；残缺事务（崩在 BEGIN/记录阶段）直接写 END 回收槽位，不重放。
+- **注入点**：`KIFS_CRASH=after_begin|after_records|after_commit|after_apply|torn`（torn 会在 COMMIT 前写坏最后一条记录的 payload CRC）。
+- **验证结论**：after_begin/after_records/torn → 内容保持旧值（事务丢弃）；after_commit/after_apply → 内容为新值（重放幂等）；所有场景重开 fsck 通过、无悬挂事务；CoW 重写实测新旧 extent 起点不同（旧 5 → 新 9），旧块被正确释放。
+- **已知简化**：journal 单槽单记录（64 块 = 64 条记录，一次写 12.8 KiB 数据约用 2 条元数据记录，容量足够 v1）；无 journal 满时的优雅降级（超限直接 SystemExit）；无 fsync/barrier 语义（宿主原型层直接 flush 文件）。

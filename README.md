@@ -2,7 +2,7 @@
 
 一个以「对象 + 倒排关键词索引」为核心的 4 KiB 块文件系统 —— 目录只是视图，语义查询是一等公民。
 
-> 状态：设计定稿（v0.1，2026-11-14）；Phase A 宿主原型（`tools/mkifs.py`）已完成，内核驱动未开始。
+> 状态：设计定稿（v0.2，2026-11-15）；Phase A 宿主原型（`tools/mkifs.py`）已完成——含 journal redo + CoW 写入路径 + 断电注入自测（29 项）；内核只读驱动 B0 已有独立分支实现，内核写入未开始。
 > 设计稿见 [docs/kifs.md](docs/kifs.md)。
 
 ## 设计速览
@@ -19,9 +19,9 @@
 
 | Phase | 内容 | 状态 |
 |---|---|---|
-| A | `tools/mkifs.py` 宿主原型（format/mkdir/write/read/ls/stat/rm/info/fsck）+ 测试镜像 | ✅ 完成（连续 extent / 目录线性 / journal 预留）|
-| B | 内核只读驱动（挂载 /MNT/KIFS） | 未开始 |
-| C | 内核写入 + journal + 断电注入测试 | 未开始 |
+| A | `tools/mkifs.py` 宿主原型（format/mkdir/write/read/ls/stat/rm/info/fsck/journal）+ 测试镜像 | ✅ 完成（连续 extent / 目录线性 / **journal redo + CoW**）|
+| B | 内核只读驱动（挂载 /MNT/KIFS） | B0 分支完成（只读驱动 + kifs 命令组，未合入）|
+| C | 内核写入 + journal + 断电注入测试 | 宿主侧已完成（journal+CoW+断电注入），内核侧未开始 |
 | D | keywords 倒排 + 语义查询 | 未开始 |
 | E | 快照/CoW、Subindex、压缩 | 未开始 |
 

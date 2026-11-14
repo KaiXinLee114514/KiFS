@@ -62,6 +62,42 @@ DIRENT_MIN = 8
 
 TYPE_FILE, TYPE_DIR = 1, 2
 
+# journal（见 docs/kifs.md §8）
+JRN_MAGIC = b"KJRN"
+JRN_HDR = 20
+JRN_PAYLOAD = BLOCK - JRN_HDR          # 4076
+JRN_STRUCT = struct.Struct("<4sIHHIHH")  # magic, seq, flags, offset, target, len, crc16
+JRN_VALID, JRN_BEGIN, JRN_COMMIT, JRN_END = 1, 2, 4, 8
+
+
+def crc16(data, crc=0xFFFF):
+    for b in data:
+        crc ^= b << 8
+        for _ in range(8):
+            if crc & 0x8000:
+                crc = ((crc << 1) ^ 0x1021) & 0xFFFF
+            else:
+                crc = (crc << 1) & 0xFFFF
+    return crc
+
+
+def jrn_pack(seq, flags, offset, target, payload=b""):
+    payload = bytes(payload)[:JRN_PAYLOAD]
+    return JRN_STRUCT.pack(JRN_MAGIC, seq, flags, offset, target,
+                           len(payload), crc16(payload)) + payload.ljust(JRN_PAYLOAD, b"\0")
+
+
+def jrn_unpack(block):
+    if len(block) < JRN_HDR:
+        return None
+    magic, seq, flags, offset, target, ln, crc = JRN_STRUCT.unpack_from(block, 0)
+    if magic != JRN_MAGIC or not (flags & JRN_VALID) or seq == 0 or ln > JRN_PAYLOAD:
+        return None
+    payload = block[JRN_HDR:JRN_HDR + ln]
+    if crc16(payload) != crc:
+        return None
+    return dict(seq=seq, flags=flags, offset=offset, target=target, payload=payload)
+
 
 # ---------------------------------------------------------------------------
 # 小工具
@@ -239,23 +275,161 @@ class Image(object):
             raise SystemExit("镜像不存在: %s" % path)
         self.blob = bytearray(open(path, "rb").read())
         self.sb = Super.unpack(self.blob[BLOCK:BLOCK + 512])
+        self._txn_deltas = []
+        self.recover()                       # 挂载即重放未完成事务
 
     # ---- 基础块访问 ----
     def block(self, n):
         return self.blob[n * BLOCK:(n + 1) * BLOCK]
 
     def put_block(self, n, data):
+        """元数据块写入（进 journal 事务）。"""
         assert len(data) <= BLOCK
         self.blob[n * BLOCK:n * BLOCK + BLOCK] = data.ljust(BLOCK, b"\0")
+        self.mark(n, 0, BLOCK)
+
+    def write_data_block(self, n, data):
+        """CoW 数据块：直接落盘，不进 journal（提交前对新块是孤儿，安全）。"""
+        chunk = bytes(data).ljust(BLOCK, b"\0")[:BLOCK]
+        self.blob[n * BLOCK:(n + 1) * BLOCK] = chunk
+        with open(self.path, "r+b") as fh:
+            fh.seek(n * BLOCK)
+            fh.write(chunk)
 
     def save(self):
-        # superblock 改过（data_next/free_blocks）就整体重写主/备副本
-        packed = self.sb.pack()
-        self.blob[BLOCK:BLOCK + 512] = packed
-        self.blob[2 * BLOCK:2 * BLOCK + 512] = packed
-        last = (self.sb.total_blocks - 1) * BLOCK
-        self.blob[last:last + 512] = packed
+        """直接整盘落盘（仅 format 用；正常路径走 flush()）。"""
         open(self.path, "wb").write(self.blob)
+
+    # ---- journal / 事务 ----
+    def mark(self, block, offset, length):
+        if 0 <= block < self.sb.total_blocks and length > 0:
+            self._txn_deltas.append((block, offset, bytes(self.blob[block * BLOCK + offset:
+                                                                 block * BLOCK + offset + length])))
+
+    def _jrn_blocks(self):
+        base = self.sb.journal_start
+        return [jrn_unpack(self.blob[(base + i) * BLOCK:(base + i + 1) * BLOCK])
+                for i in range(self.sb.journal_blocks)]
+
+    def _jrn_state(self):
+        blocks = self._jrn_blocks()
+        txns = {}
+        for i, b in enumerate(blocks):
+            if not b:
+                continue
+            t = txns.setdefault(b["seq"], {"begin": None, "commit": None, "end": None, "recs": []})
+            if b["flags"] & JRN_BEGIN:
+                t["begin"] = i
+            elif b["flags"] & JRN_COMMIT:
+                t["commit"] = i
+            elif b["flags"] & JRN_END:
+                t["end"] = i
+            else:
+                t["recs"].append((b["target"], b["offset"], b["payload"], i))
+        return txns, blocks
+
+    def recover(self):
+        """重放已 COMMIT 但未 END 的完整事务（幂等）；丢弃未提交的残缺事务。返回重放数。"""
+        txns, _blocks = self._jrn_state()
+        n = 0
+        for seq in sorted(txns):
+            t = txns[seq]
+            if t["end"] is not None:
+                continue
+            if t["begin"] is None or t["commit"] is None:
+                # 残缺事务（崩在 BEGIN/记录阶段）：未应用过，直接标 END 回收槽位
+                slot = t["begin"] if t["begin"] is not None else t["commit"]
+                if slot is not None:
+                    data = jrn_pack(seq, JRN_VALID | JRN_END, 0, 0, b"")
+                    off = (self.sb.journal_start + slot) * BLOCK
+                    with open(self.path, "r+b") as fh:
+                        fh.seek(off)
+                        fh.write(data)
+                    self.blob[off:off + BLOCK] = data
+                continue
+            with open(self.path, "r+b") as fh:
+                for target, off, payload, _slot in sorted(t["recs"]):
+                    if target < 0 or target >= self.sb.total_blocks:
+                        continue
+                    fh.seek(target * BLOCK + off)
+                    fh.write(payload)
+                    self.blob[target * BLOCK + off:target * BLOCK + off + len(payload)] = payload
+                data = jrn_pack(seq, JRN_VALID | JRN_END, 0, 0, b"")
+                off = (self.sb.journal_start + t["begin"]) * BLOCK
+                fh.seek(off)
+                fh.write(data)
+                self.blob[off:off + BLOCK] = data
+            n += 1
+        return n
+
+    def flush(self):
+        """把本事务的元数据增量写入 journal 并应用。"""
+        deltas = self._txn_deltas
+        self._txn_deltas = []
+        sb_new = self.sb.pack()
+        if bytes(self.blob[BLOCK:BLOCK + 112]) != sb_new[:112]:
+            for bk in (1, 2, self.sb.total_blocks - 1):
+                deltas.append((bk, 0, sb_new))
+        if deltas:
+            self._jrn_commit(deltas)
+
+    def _jrn_commit(self, deltas):
+        crash = os.environ.get("KIFS_CRASH", "")
+        txns, blocks = self._jrn_state()
+        seq = (max(txns) + 1) if txns else 1
+        used = [i for i, b in enumerate(blocks) if b]
+        n = self.sb.journal_blocks
+        idx = (max(used) + 1) % n if used else 0
+        # 大增量按 JRN_PAYLOAD 切片
+        recs = []
+        for (block, off, payload) in deltas:
+            payload = bytes(payload)
+            for i in range(0, len(payload), JRN_PAYLOAD):
+                recs.append((block, off + i, payload[i:i + JRN_PAYLOAD]))
+        if len(recs) + 3 > n:
+            raise SystemExit("journal 满（%d 条记录 > %d 块）" % (len(recs) + 3, n))
+        start = idx
+        fh = open(self.path, "r+b")
+
+        def w(flags, offset, target, payload=b""):
+            nonlocal idx
+            data = jrn_pack(seq, JRN_VALID | flags, offset, target, payload)
+            off = (self.sb.journal_start + idx) * BLOCK
+            fh.seek(off)
+            fh.write(data)
+            self.blob[off:off + BLOCK] = data
+            idx = (idx + 1) % n
+
+        w(JRN_BEGIN, 0, 0)
+        if crash == "after_begin":
+            fh.flush(); fh.close(); raise SystemExit(2)
+        for (block, off, payload) in recs:
+            w(0, off, block, payload)
+        if crash == "after_records":
+            fh.flush(); fh.close(); raise SystemExit(2)
+        if crash == "torn":
+            # 写坏最后一条记录的 payload，模拟撕裂写
+            last = (self.sb.journal_start + ((idx - 1) % n)) * BLOCK
+            fh.seek(last + JRN_HDR)
+            fh.write(b"\xff")
+            fh.flush(); fh.close(); raise SystemExit(2)
+        w(JRN_COMMIT, 0, 0)
+        if crash == "after_commit":
+            fh.flush(); fh.close(); raise SystemExit(2)
+        for (block, off, payload) in recs:
+            fh.seek(block * BLOCK + off)
+            fh.write(payload)
+            self.blob[block * BLOCK + off:block * BLOCK + off + len(payload)] = payload
+        if crash == "after_apply":
+            fh.flush(); fh.close(); raise SystemExit(2)
+        # END 覆盖写回 BEGIN 槽
+        data = jrn_pack(seq, JRN_VALID | JRN_END, 0, 0, b"")
+        off = (self.sb.journal_start + start) * BLOCK
+        fh.seek(off)
+        fh.write(data)
+        self.blob[off:off + BLOCK] = data
+        fh.flush()
+        fh.close()
 
     # ---- 位图 ----
     def _bitmap_block(self):
@@ -271,6 +445,7 @@ class Image(object):
             self.blob[off] |= (1 << (blk % 8))
         else:
             self.blob[off] &= ~(1 << (blk % 8)) & 0xFF
+        self.mark(self._bitmap_block(), blk // 8, 1)
 
     # ---- Record ----
     def rec_off(self, oid):
@@ -285,9 +460,20 @@ class Image(object):
         r = Record.unpack(data)
         return r if r.type else None
 
+    def mark_span(self, byte_off, length):
+        """把一段字节范围拆成若干 mark（可能跨块）。"""
+        while length > 0:
+            block = byte_off // BLOCK
+            off = byte_off % BLOCK
+            n = min(length, BLOCK - off)
+            self.mark(block, off, n)
+            byte_off += n
+            length -= n
+
     def write_record(self, r):
         data = r.pack()
         self.blob[self.rec_off(r.oid):self.rec_off(r.oid) + RECORD_SIZE] = data[:RECORD_SIZE]
+        self.mark_span(self.sb.record_start * BLOCK + r.oid * RECORD_SIZE, RECORD_SIZE)
 
     def alloc_oid(self):
         for oid in range(1, self.sb.record_count):
@@ -332,30 +518,44 @@ class Image(object):
         return out[:rec.size]
 
     def write_content(self, rec, data):
-        # 先释放旧的
-        self.record_free_data(rec)
+        """CoW 写：数据块永远写新块（提交前是孤儿、安全），旧块在本事务内释放。"""
         n = len(data)
-        rec.size = n
+        old_inline = rec.inline_len
+        old_extents = list(rec.extents)
         if n <= INLINE_MAX:
+            # inline：先释放旧数据块，再改 record（record 更新走 journal）
+            if old_extents:
+                for (st, cnt) in old_extents:
+                    self.free_blocks(st, cnt)
+            rec.size = n
             rec.inline_len = n
             rec.inline_data = data
             rec.n_ext = 0
+            rec.n_ext_total = 0
             rec.blocks = 0
             rec.extents = []
             return
         blocks = (n + BLOCK - 1) // BLOCK
+        # 1) 旧块仍占用时分配新块（保证不复用旧块 → CoW）
         start = self.alloc_blocks(blocks)
         if start is None:
             raise SystemExit("盘满（连续 %d 块分配不到）" % blocks)
+        # 2) 新数据块直接落盘（不进 journal；提交前是孤儿）
         for i in range(blocks):
             chunk = data[i * BLOCK:(i + 1) * BLOCK]
-            self.put_block(start + i, chunk)
+            self.write_data_block(start + i, chunk)
+        # 3) 释放旧数据块（位图变更走 journal）
+        if old_extents:
+            for (st, cnt) in old_extents:
+                self.free_blocks(st, cnt)
+        rec.size = n
         rec.inline_len = 0
         rec.inline_data = b""
         rec.extents = [(start, blocks)]
         rec.n_ext = 1
         rec.n_ext_total = 1
         rec.blocks = blocks
+        _ = old_inline  # 旧 inline 无块可释放
 
     def record_free_data(self, rec):
         if rec.extents:
@@ -538,6 +738,7 @@ def cmd_format(args):
     img.blob = blob
     img.sb = sb
     img.path = args.img
+    img._txn_deltas = []
     for b in range(0, sb.data_next):
         img.bit_set(b, 1)
     for b in range(sb.meta_next, total):
@@ -567,7 +768,7 @@ def open_img(args):
 def cmd_mkdir(args):
     img = open_img(args)
     img.mkdir(args.path, perm=parse_perm(args.perm) if args.perm else PERM_DIR_DEFAULT)
-    img.save()
+    img.flush()
     print("✅ mkdir %s" % args.path)
 
 
@@ -582,7 +783,7 @@ def cmd_write(args):
         data = sys.stdin.buffer.read()
     img = open_img(args)
     img.write_file(args.path, data, perm=parse_perm(args.perm) if args.perm else None)
-    img.save()
+    img.flush()
     print("✅ write %s (%d 字节)" % (args.path, len(data)))
 
 
@@ -647,7 +848,7 @@ def cmd_stat(args):
 def cmd_rm(args):
     img = open_img(args)
     img.rm(args.path)
-    img.save()
+    img.flush()
     print("✅ rm %s" % args.path)
 
 
@@ -692,6 +893,11 @@ def cmd_fsck(args):
     for bk in (2, sb.total_blocks - 1):
         if img.block(bk)[:112] != img.block(1)[:112]:
             problems.append("superblock 备份 @块 %d 与主副本不一致" % bk)
+    # journal：open 时已 recover，这里只应剩「未提交的旧事务」；有未重放的完整事务才是问题
+    txns, _jblocks = img._jrn_state()
+    pending = [s for s, t in txns.items() if t["commit"] is not None and t["end"] is None]
+    if pending:
+        problems.append("journal 有 %d 个已提交未重放事务: %s" % (len(pending), pending))
     # 固定区占用
     for b in range(0, data_area):
         take(b, "固定区")
@@ -800,6 +1006,19 @@ def cmd_fsck(args):
     return 0
 
 
+def cmd_journal(args):
+    img = open_img(args)
+    txns, _blocks = img._jrn_state()
+    print("journal: %d 块, %d 个事务" % (img.sb.journal_blocks, len(txns)))
+    for seq in sorted(txns):
+        t = txns[seq]
+        state = "END" if t["end"] is not None else ("COMMIT" if t["commit"] is not None else "OPEN")
+        print("  seq=%d state=%s records=%d" % (seq, state, len(t["recs"])))
+    if not txns:
+        print("  （空）")
+    return 0
+
+
 def main():
     ap = argparse.ArgumentParser(description="KiFS 宿主工具 (Phase A)")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -823,6 +1042,9 @@ def main():
 
     p = sub.add_parser("stat"); p.add_argument("img"); p.add_argument("path")
     p.set_defaults(func=cmd_stat)
+
+    p = sub.add_parser("journal"); p.add_argument("img")
+    p.set_defaults(func=cmd_journal)
 
     p = sub.add_parser("rm"); p.add_argument("img"); p.add_argument("path")
     p.set_defaults(func=cmd_rm)
