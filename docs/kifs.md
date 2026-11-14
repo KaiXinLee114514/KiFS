@@ -260,8 +260,8 @@ rwxrwxrwx111kai
   - format / mkdir / write / read / ls / 小文件内联 / extent 分配 / fsck
   - Python 单文件，输出 4 MiB 测试镜像；与设计表逐字节对齐
 - **Phase B（内核只读）**：`kernel/kifs.asm`
-  - mount（校验 superblock + journal 重放判定）、ls、cat、按关键词过滤的只读查询
-  - 挂载点 `/MNT/KIFS`（`/MNT` 目录已存在）
+  - **B0（已完成，2026-11-14）**：KKernel 里的只读驱动 + `kifs` 命令组 —— `kifs info` / `ls [路径]` / `cat <路径>` / `stat <路径>`；superblock 校验（魔数 / 版本 / CRC32）、目录项逐段遍历、内联 + extent 读取。**固定 LBA 22528**、只读、不挂 VFS；宿主 `mkifs.py` 造的镜像 dd 到 16 MB 盘 FAT16 分区之后自测（`make test-kifs`，12 项屏幕断言）
+  - B1（待做）：mount（校验 superblock + journal 重放判定）、按关键词过滤的只读查询、挂载点 `/MNT/KIFS`
 - **Phase C（内核写入）**：写文件 + extent 分配 + journal + 断电注入测试
 - **Phase D（关键词）**：tag 命令 + 倒排表构建/查询；语义查询解析器可放外部工具
 - **Phase E（后续）**：快照/CoW、Subindex 树、压缩、加密
@@ -298,3 +298,15 @@ rwxrwxrwx111kai
 7. 断电测试怎么做：QEMU `-snapshot` + 杀进程 + 重新挂载 fsck
 8. owner 直存用户名（v1）vs 以后改 uid 表（需要用户系统）
 9. group/other 的 rwx 在单用户 v1 是否只展示不强制（倾向只展示）
+
+---
+
+## 15. 内核驱动 B0 注意事项
+
+- **分区位置固定**：`KIFS_PART_LBA = 22528`。16 MB 硬盘镜像里 FAT16 分区从 LBA 6144 起 8 MB，正好在 22528 结束，KiFS 镜像（4 MiB = 1024 块）就 dd 到 22528 之后；测试命令 `make test-kifs`。
+- **superblock 在分区块 1，不在块 0**：块 0 是引导块留空，主副本在块 1、备份在块 2 与最后一块。内核读块 1，校验魔数 / 版本 / 前 108 字节的 CRC32（`zlib.crc32` 对齐）。⚠️ 设计草稿早期写的「块 0 偏移 0 / label@92」与 `mkifs.py` 实际不符（实际 `label@76`），以 `mkifs.py` 为准。
+- **只读**：不写盘、不重放 journal（v1 的 `flags` clean 位不做恢复动作）。
+- **不校验 owner 权限 / 不做 hide 过滤**：单用户 v1，`ls` 把 `hide` 项也列出来；`perm` 只展示 `rwxrwxrwx` + hide/ro/iolock 三位 + owner。
+- **MVP 限制**：目录内容 ≤ 4 KiB（每层目录单块缓冲）；`cat` 单文件 ≤ 60 KiB（按块流式读，不整文件进内存）。
+- **内联 record 的 36..128 字节被内联数据覆盖**（v0 宿主实现行为）：所以 `inline_len > 0` 时不要解析 extent 区 / owner 字段。
+- **静默失败**：盘上没 KiFS 卷（魔数 / CRC 不对、读盘失败）时 `kifs_init` 直接返回，不影响原有 FAT / 软盘启动路径。
