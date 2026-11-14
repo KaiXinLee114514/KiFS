@@ -10,7 +10,7 @@
 - 盘头 Superblock（带备份）→ 块位图 / Record 表 / 数据块向上长
 - 关键词串池 / Subindex / Journal（redo）从盘尾向下长，双游标
 - Record 128 B：oid/type/flags/perm(16 位)/size/时间/parent/kw_index/owner + 小文件内联 ≤92 B + 最多 3 个内联 extent
-- 权限展示：`rwxrwxrwx-hide-ro-iolock-owner:kai`（hide/ro/iolock 都是 perm 位）
+- 权限展示：`rwxrwxrwx111kai`（9 位 rwx + 3 位 hide/ro/iolock + 用户名；hide/ro/iolock 都是 perm 位）
 - 目录 = 有序 UTF-8 目录项；关键词 = 串池 + 倒排 OID 数组
 - 断电一致性：BEGIN → BLOCK → COMMIT → 落盘 → END 的环形 journal
 - 查询示例：`"Last Summer family photos"` → 时间区间 + 类型 + keyword 的结构化过滤

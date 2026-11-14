@@ -196,13 +196,18 @@ Record 表放在块 1 之后固定区域：`record_start` 起，槽号即 OID。
 | bit11 | `iolock` | 被锁：运行期独占标记（见下） |
 | bit12-15 | 预留 | 填 0 |
 
-配合 Record 里的 `owner`（16 B 用户名，如 `kai`），完整展示格式：
+配合 Record 里的 `owner`（16 B 用户名，如 `kai`），完整展示格式（紧凑式，固定 12 字符头 + 用户名）：
 
 ```
-rwxrwxrwx-hide-ro-iolock-owner:kai
+rwxrwxrwx111kai
 ```
 
-（未置位的项也照样打印，方便 `ls -l` 一眼对齐；`iolock` 是运行期状态位）
+- 前 9 字符 = `rwxrwxrwx`
+- 接着 3 个数字位 = `hide ro iolock`（顺序固定，1=置位，0=未置位）
+- 余下即 `owner` 用户名
+
+例：`rw-r--r--010kai` = owner 可读写、其他只读、ro=1、iolock=0、owner=kai。
+（`iolock` 是运行期状态位，展示/调试用）
 
 语义：
 - **hide**：默认目录列表不显示；显式路径访问仍然可以。
