@@ -2,7 +2,7 @@
 
 一个以「对象 + 倒排关键词索引」为核心的 4 KiB 块文件系统 —— 目录只是视图，语义查询是一等公民。
 
-> 状态：设计定稿（v0.1，2026-11-14），实现未开始。
+> 状态：设计定稿（v0.1，2026-11-14）；Phase A 宿主原型（`tools/mkifs.py`）已完成，内核驱动未开始。
 > 设计稿见 [docs/kifs.md](docs/kifs.md)。
 
 ## 设计速览
@@ -19,11 +19,28 @@
 
 | Phase | 内容 | 状态 |
 |---|---|---|
-| A | `tools/mkifs.py` 宿主原型（format/mkdir/write/read/ls/fsck）+ 测试镜像 | 未开始 |
+| A | `tools/mkifs.py` 宿主原型（format/mkdir/write/read/ls/stat/rm/info/fsck）+ 测试镜像 | ✅ 完成（连续 extent / 目录线性 / journal 预留）|
 | B | 内核只读驱动（挂载 /MNT/KIFS） | 未开始 |
 | C | 内核写入 + journal + 断电注入测试 | 未开始 |
 | D | keywords 倒排 + 语义查询 | 未开始 |
 | E | 快照/CoW、Subindex、压缩 | 未开始 |
+
+## 宿主原型快速上手
+
+```bash
+python3 tools/mkifs.py format /tmp/kifs.img --size-mib 4
+python3 tools/mkifs.py mkdir  /tmp/kifs.img /docs
+python3 tools/mkifs.py write  /tmp/kifs.img /docs/hello.txt --data "hello kifs"
+python3 tools/mkifs.py read   /tmp/kifs.img /docs/hello.txt
+python3 tools/mkifs.py ls     /tmp/kifs.img /docs
+python3 tools/mkifs.py fsck   /tmp/kifs.img
+```
+
+自测（临时目录里跑完整流程，含损坏检测）：
+
+```bash
+python3 tools/test_mkifs.py
+```
 
 ## 为什么不开源（暂时）
 
