@@ -7,6 +7,7 @@
 > `tools/test_journal.py` 91 项（4K+16K）。本仓库 `kernel/` 下的汇编驱动仍是 v1 格式，
 > 需要按 v2 规格升级（见 [docs/integration.md](docs/integration.md)）。
 > 设计稿：[docs/kifs.md](docs/kifs.md) · v2 规格：[docs/kifs-v2.md](docs/kifs-v2.md) · 集成指南：[docs/integration.md](docs/integration.md)
+> Linux 可用 FUSE 直接挂载（读写走 journal+CoW）：[linux/README.md](linux/README.md)
 
 ## 设计速览
 
@@ -31,9 +32,15 @@ kifs/
 │   ├── kifs.asm          KiFS 内核驱动（x86 nasm 平铺，Phase C1 读写+journal+CoW）
 │   └── README.md         驱动说明（命令/内存布局/写入语义/测试）
 ├── tools/
-│   ├── mkifs.py          宿主工具（v2）：format/mkdir/write/read/ls/stat/rm/info/fsck/journal
+│   ├── mkifs.py          宿主工具（v2）：format/mount/mkdir/write/read/ls/stat/rm/info/fsck/journal
 │   ├── test_mkifs.py     宿主自测 192 项（4 KiB + 16 KiB）
 │   └── test_journal.py   断电注入自测 91 项（4K+16K × after_begin/records/commit/apply/torn）
+├── linux/
+│   ├── fuse_kifs.py      FUSE 驱动（挂载镜像/块设备，读写走 Image 的 journal+CoW）
+│   ├── test_fuse.sh      端到端测试：真挂载→POSIX 操作→卸载→fsck+字节比对
+│   ├── test_image_api.py Image 块级 API 自测（inline/随机写/ext_index/truncate）
+│   ├── requirements.txt  fusepy>=3.0（装进仓库 .venv）
+│   └── README.md         依赖/挂载卸载/权限/限制/排障
 └── README.md
 ```
 
@@ -48,6 +55,7 @@ kifs/
 | C | 内核写入 + journal + 断电注入测试 | ✅ C1：内核写入 + journal + CoW（`kifs-phase-c` 分支，48 项断言）；C2 真机 kill -9 压测待做 |
 | D | keywords 倒排 + 语义查询 | 未开始 |
 | E | 快照/CoW、Subindex、压缩 | 未开始 |
+| F | Linux FUSE 挂载（免内核模块，读写走 journal+CoW） | ✅ `linux/fuse_kifs.py` + `linux/test_fuse.sh` |
 
 ## 宿主原型快速上手
 
@@ -79,6 +87,34 @@ python3 tools/test_journal.py   # 91 项：4K+16K × 5 种断电注入 + CoW
 ```bash
 make test-kifs        # 48 项：内核读写/journal/reboot 持久化/崩溃重放/宿主交叉验证
 ```
+
+## Linux 挂载（FUSE）
+
+不需要内核模块：用户态 FUSE 把 KiFS 镜像或块设备挂成普通目录，所有写入走
+`tools/mkifs.py` 的 journal+CoW（与宿主工具同一套代码，掉电可重放）。
+
+```bash
+# 一次性：装依赖（fusepy 3.x；Debian 自带的 2.x 不兼容）
+python3 -m venv .venv
+.venv/bin/pip install -r linux/requirements.txt
+
+# 造卷 → 挂载 → 用 → 卸载 → 校验
+tools/mkifs.py format /tmp/kifs.img --size-mib 4
+tools/mkifs.py mount  /tmp/kifs.img /mnt/kifs
+ls -la /mnt/kifs && cp bigfile /mnt/kifs/ && sync
+fusermount3 -u /mnt/kifs
+tools/mkifs.py fsck /tmp/kifs.img
+```
+
+- **块设备**：`sudo tools/mkifs.py format /dev/sdb1 --size-mib N` 后
+  `sudo tools/mkifs.py mount /dev/sdb1 /mnt/kifs`（整盘就是卷，需要 root）；
+  盘上有分区表/别的头时 `format`/`mount` 都加 `--offset-lba 22528`（内核驱动的固定
+  分区）或 `--offset BYTES`。
+- **只读/hide/offline 卷**：`--read-only`、`--show-hidden`、`--offset` 等选项与限制
+  （单线程、不支持稀疏文件、盘满 ENOSPC、ext_index 碎片化）见 [linux/README.md](linux/README.md)。
+- **测试**：`linux/test_fuse.sh` —— 4K/4MiB 与 16K/64MiB 两张镜像，挂载→
+  mkdir/cp/dd/rename/chmod/truncate/append→卸载→`fsck` 必过 + 离线字节比对；
+  root 下会额外跑 loop 块设备路径。
 
 ## 内核驱动快速上手
 

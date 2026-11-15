@@ -35,7 +35,9 @@ v2 简化（见 docs/kifs.md §12 Phase A）：
 """
 
 import argparse
+import errno
 import os
+import stat
 import struct
 import sys
 import time
@@ -338,28 +340,65 @@ class Record(object):
 # ---------------------------------------------------------------------------
 # 镜像（按需读 + 块缓存；不整盘载入内存）
 # ---------------------------------------------------------------------------
+def device_size(path):
+    """镜像文件大小，或块设备的字节数（BLKGETSIZE64）。"""
+    st = os.stat(path)
+    if stat.S_ISBLK(st.st_mode):
+        import array
+        import fcntl
+        try:
+            with open(path, "rb") as f:
+                buf = array.array("Q", [0])
+                fcntl.ioctl(f.fileno(), 0x80081272, buf, True)
+                return buf[0]
+        except OSError as e:
+            raise SystemExit("读块设备大小失败: %s" % e)
+    return st.st_size
+
+
 class Image(object):
-    def __init__(self, path):
+    def __init__(self, path, offset=0):
         self.path = path
+        self.offset = int(offset or 0)
+        if self.offset < 0:
+            raise SystemExit("offset 不能为负: %d" % self.offset)
         if not os.path.exists(path):
             raise SystemExit("镜像不存在: %s" % path)
         self.fh = open(path, "r+b")
+        self.dev_size = self._device_size()
+        if self.offset + 512 > self.dev_size:
+            raise SystemExit("offset %d 超出设备大小 %d" % (self.offset, self.dev_size))
         self.bs = None
         self._cache = {}
         self._dirty = set()
         self._txn_deltas = []
+        self._used_recs = None
         self.sb = self._probe_super()
         self.bs = self.sb.block_size
+        if self.offset + self.sb.total_blocks * self.bs > self.dev_size:
+            raise SystemExit(
+                "KiFS 卷 [%d, %d) 超出设备大小 %d（offset 不对？）" %
+                (self.offset, self.offset + self.sb.total_blocks * self.bs,
+                 self.dev_size))
         self.recover()                       # 挂载即重放未完成事务
+
+    def _device_size(self):
+        return device_size(self.path)
+
+    def close(self):
+        try:
+            self.fh.close()
+        except OSError:
+            pass
 
     # ---- 底层 I/O ----
     def _pread(self, off, n):
-        self.fh.seek(off)
+        self.fh.seek(self.offset + off)
         return self.fh.read(n)
 
     def _disk_write(self, off, data):
         """直接落盘（journal 应用 / 数据块），并同步已缓存的块。"""
-        self.fh.seek(off)
+        self.fh.seek(self.offset + off)
         self.fh.write(data)
         if self.bs is None:
             return
@@ -562,6 +601,54 @@ class Image(object):
             self._jrn_commit(deltas)
         self.fh.flush()
 
+    def sync(self):
+        """flush 事务并 fsync 到设备（FUSE fsync 用）。"""
+        self.flush()
+        try:
+            os.fsync(self.fh.fileno())
+        except OSError:
+            pass
+
+    def reload(self):
+        """丢弃未提交的内存事务，回到盘上已提交状态（写失败时回滚用）。"""
+        self._cache.clear()
+        self._dirty.clear()
+        self._txn_deltas = []
+        self._used_recs = None
+        self.sb = Super.unpack(self._pread(self.bs, 512))
+
+    def sync(self):
+        """flush 事务并 fsync 到设备（FUSE fsync 用）。"""
+        self.flush()
+        try:
+            os.fsync(self.fh.fileno())
+        except OSError:
+            pass
+
+    def reload(self):
+        """丢弃未提交的内存事务，回到盘上已提交状态（写失败时回滚用）。"""
+        self._cache.clear()
+        self._dirty.clear()
+        self._txn_deltas = []
+        self._used_recs = None
+        self.sb = Super.unpack(self._pread(self.bs, 512))
+
+    def sync(self):
+        """flush 事务并 fsync 到设备（FUSE fsync 用）。"""
+        self.flush()
+        try:
+            os.fsync(self.fh.fileno())
+        except OSError:
+            pass
+
+    def reload(self):
+        """丢弃未提交的内存事务，回到盘上已提交状态（写失败时回滚用）。"""
+        self._cache.clear()
+        self._dirty.clear()
+        self._txn_deltas = []
+        self._used_recs = None
+        self.sb = Super.unpack(self._pread(self.bs, 512))
+
     def _jrn_commit(self, deltas):
         crash = os.environ.get("KIFS_CRASH", "")
         txns, blocks = self._jrn_state()
@@ -692,7 +779,8 @@ class Image(object):
         oid = 1
         while oid < self.sb.record_count:
             n = min(step, self.sb.record_count - oid)
-            raw = self._read_bytes(self.rec_off(oid), n * RECORD_SIZE, use_cache=False)
+            # 走块缓存：同一事务里刚分配（尚未 flush）的 record 也要能看到
+            raw = self._read_bytes(self.rec_off(oid), n * RECORD_SIZE)
             for i in range(n):
                 if raw[i * RECORD_SIZE + 4] == 0:      # type == 0 → 空槽
                     return oid + i
@@ -929,6 +1017,477 @@ class Image(object):
         self.dir_remove(parent, name)
         self.write_record(parent)
 
+    # ------------------------------------------------------------------
+    # 块级 / 区间 API（FUSE 驱动用；调用方负责 at 方法之后 flush()）
+    #
+    # 设计要点：
+    #   * read_at 只读请求覆盖的块，不整文件进内存；
+    #   * write_at 是「增量 CoW」：只给被修改的块分配新块，未改动的 extent
+    #     原样保留并共享；旧块在新块写完之后才释放，提交前断电不会破坏旧数据；
+    #   * 顺序追加（off == rec.size）走快速路径：只写 EOF 之后的字节（不改变
+    #     任何已提交字节），并尝试把最后一个 extent 向后扩，避免产生碎片；
+    #   * extent > 3 段时写 ext_index 表（新表块 CoW 分配，旧表块释放）。
+    # ------------------------------------------------------------------
+    def path_parts(self, path):
+        return [p for p in (path or "/").replace("\\", "/").split("/") if p]
+
+    def record_at(self, path):
+        """按路径取 record；不存在返回 None，路径中间不是目录抛 ENOTDIR。"""
+        oid = self.sb.root_oid
+        for p in self.path_parts(path):
+            rec = self.read_record(oid)
+            if rec is None or rec.type != TYPE_DIR:
+                raise NotADirectoryError(errno.ENOTDIR, "不是目录: %s" % p)
+            nxt = self.dir_lookup(rec, p)
+            if nxt is None:
+                return None
+            oid = nxt
+        return self.read_record(oid)
+
+    def parent_record(self, path):
+        """返回 (parent_rec, name)；根路径抛 EISDIR（不能对根操作）。"""
+        parts = self.path_parts(path)
+        if not parts:
+            raise IsADirectoryError(errno.EISDIR, "是根目录")
+        oid = self.sb.root_oid
+        for p in parts[:-1]:
+            rec = self.read_record(oid)
+            if rec is None or rec.type != TYPE_DIR:
+                raise NotADirectoryError(errno.ENOTDIR, "不是目录: %s" % p)
+            nxt = self.dir_lookup(rec, p)
+            if nxt is None:
+                raise FileNotFoundError(errno.ENOENT, "目录不存在: %s" % p)
+            oid = nxt
+        parent = self.read_record(oid)
+        if parent is None or parent.type != TYPE_DIR:
+            raise NotADirectoryError(errno.ENOTDIR, "父路径不是目录")
+        return parent, parts[-1]
+
+    def used_records(self):
+        """已用 record 槽数（statfs 的 f_files 用；结果缓存，写入时失效）。"""
+        if self._used_recs is not None:
+            return self._used_recs
+        n = 0
+        step = 4096
+        oid = 1
+        while oid < self.sb.record_count:
+            k = min(step, self.sb.record_count - oid)
+            raw = self._read_bytes(self.rec_off(oid), k * RECORD_SIZE)
+            for i in range(k):
+                if raw[i * RECORD_SIZE + 4]:
+                    n += 1
+            oid += k
+        self._used_recs = n
+        return n
+
+    def statfs_info(self):
+        sb = self.sb
+        used = self.used_records()
+        return {"block_size": self.bs, "blocks": sb.total_blocks,
+                "free_blocks": sb.free_blocks,
+                "files": sb.record_count, "free_files": max(0, sb.record_count - used)}
+
+    # ---- 读 ----
+    def read_at(self, rec, off, n):
+        """读文件 [off, off+n)，只碰覆盖到的块；返回实际读到的字节。"""
+        if off < 0 or n < 0:
+            raise OSError(errno.EINVAL, "偏移/长度为负")
+        if n == 0 or off >= rec.size:
+            return b""
+        n = min(n, rec.size - off)
+        if rec.inline_len:
+            return bytes(rec.inline_data[off:off + n])
+        out = bytearray(n)
+        pos = 0
+        for (st, cnt) in self.rec_extents(rec):
+            e0 = pos
+            e1 = pos + cnt * self.bs
+            pos = e1
+            a = max(off, e0)
+            b = min(off + n, e1)
+            if a < b:
+                out[a - off:b - off] = self._read_bytes(
+                    st * self.bs + (a - e0), b - a, use_cache=False)
+        return bytes(out)
+
+    def read_file_at(self, path, off, n):
+        rec = self.record_at(path)
+        if rec is None:
+            raise FileNotFoundError(errno.ENOENT, "找不到: %s" % path)
+        if rec.type != TYPE_FILE:
+            raise IsADirectoryError(errno.EISDIR, "是目录: %s" % path)
+        return self.read_at(rec, off, n)
+
+    # ---- 写（增量 CoW） ----
+    def _split_extents(self, exts, lo, hi):
+        """把逻辑块区间 [lo,hi) 从 extent 列表里切出来。
+
+        返回 (head, tail, free_ranges)：head/tail 是保留的前后片段（含物理块号），
+        free_ranges 是旧的、将被替换的物理块区间。
+        """
+        head, tail, free_ranges = [], [], []
+        pos = 0
+        for (st, cnt) in exts:
+            e0, e1 = pos, pos + cnt
+            pos = e1
+            if e0 < lo:
+                take = min(e1, lo) - e0
+                if take > 0:
+                    head.append((st, take))
+            if e1 > hi:
+                cut = max(e0, hi) - e0
+                tail.append((st + cut, e1 - max(e0, hi)))
+            f0, f1 = max(e0, lo), min(e1, hi)
+            if f0 < f1:
+                free_ranges.append((st + (f0 - e0), f1 - f0))
+        return head, tail, free_ranges
+
+    def _read_old_bytes(self, exts, off, n):
+        """按逻辑偏移从 extent 列表读 n 字节（用于读-改-写被覆盖的旧块）。"""
+        out = bytearray(n)
+        pos = 0
+        for (st, cnt) in exts:
+            e0, e1 = pos, pos + cnt * self.bs
+            pos = e1
+            a = max(off, e0)
+            b = min(off + n, e1)
+            if a < b:
+                out[a - off:b - off] = self._read_bytes(
+                    st * self.bs + (a - e0), b - a, use_cache=False)
+        return bytes(out)
+
+    def _set_inline(self, rec, data):
+        rec.size = len(data)
+        rec.blocks = 0
+        rec.inline_len = len(data)
+        rec.inline_off = INLINE_OFF
+        rec.inline_data = bytes(data)
+        rec.n_ext = 0
+        rec.n_ext_total = 0
+        rec.extents = []
+        rec.ext_index = 0
+
+    def _set_extents(self, rec, exts, size):
+        """合并相邻 extent 并写回 record；>3 段时同时写 ext_index 表（CoW）。"""
+        merged = []
+        for (st, cnt) in exts:
+            if cnt <= 0:
+                continue
+            if merged and merged[-1][0] + merged[-1][1] == st:
+                merged[-1] = (merged[-1][0], merged[-1][1] + cnt)
+            else:
+                merged.append((st, cnt))
+        old_idx = rec.ext_index
+        old_idx_n = self.ext_index_blocks(rec)
+        rec.size = size
+        rec.blocks = sum(c for (_s, c) in merged)
+        rec.inline_len = 0
+        rec.inline_data = b""
+        if len(merged) > 3:
+            nblk = ceil_div(len(merged) * 12, self.bs)
+            start = self.alloc_blocks(nblk)
+            if start is None:
+                raise OSError(errno.ENOSPC, "盘满（ext_index 表 %d 块）" % nblk)
+            blob = b"".join(EXT_STRUCT.pack(st, cnt) for (st, cnt) in merged)
+            for i in range(nblk):
+                self.write_data_block(start + i, blob[i * self.bs:(i + 1) * self.bs])
+            if old_idx and old_idx_n:
+                self.free_blocks(old_idx, old_idx_n)
+            rec.ext_index = start
+            rec.extents = merged[:3]
+            rec.n_ext = 3
+            rec.n_ext_total = len(merged)
+        else:
+            if old_idx and old_idx_n:
+                self.free_blocks(old_idx, old_idx_n)
+            rec.ext_index = 0
+            rec.extents = merged
+            rec.n_ext = len(merged)
+            rec.n_ext_total = len(merged)
+
+    def _try_append(self, rec, data):
+        """顺序追加快速路径：只写 EOF 之后的字节 + 尝试原地扩最后一个 extent。
+
+        返回 True 表示已处理；False 表示条件不满足，调用方走通用 CoW 路径。
+        安全性：写入的字节全部 >= 已提交的 size，崩溃时旧内容（含 size）不变。
+        """
+        old_size = rec.size
+        if old_size <= INLINE_MAX or rec.inline_len:
+            return False
+        exts = [(st, cnt) for (st, cnt) in self.rec_extents(rec)]
+        if not exts:
+            return False
+        st, cnt = exts[-1]
+        if old_size % self.bs:
+            room = self.bs - (old_size % self.bs)
+            k = min(room, len(data))
+            self._disk_write((st + cnt - 1) * self.bs + (old_size % self.bs), data[:k])
+            old_size += k
+            data = data[k:]
+            rec.size = old_size
+        if not data:
+            self._set_extents(rec, exts, old_size)
+            return True
+        n_new = ceil_div(len(data), self.bs)
+        base = st + cnt
+        if base != self.sb.data_next:
+            return False                      # 尾部不连续 → 走 CoW 路径（避免碎片）
+        for b in range(base, base + n_new):
+            if b >= self.sb.meta_next or self.bit_get(b):
+                return False
+        # 数据块先落盘（提交前是孤儿，安全），再改位图/record（走 journal）
+        for i in range(n_new):
+            self.write_data_block(base + i, data[i * self.bs:(i + 1) * self.bs])
+        for b in range(base, base + n_new):
+            self.bit_set(b, 1)
+        self.sb.data_next = base + n_new
+        self.sb.free_blocks -= n_new
+        exts[-1] = (st, cnt + n_new)
+        self._set_extents(rec, exts, old_size + len(data))
+        return True
+
+    def write_at(self, rec, off, data):
+        """把 data 写到文件 [off, off+len)（写洞自动补零），返回新 size 相关字段。"""
+        if off < 0:
+            raise OSError(errno.EINVAL, "偏移为负")
+        data = bytes(data)
+        if not data:
+            return
+        end = off + len(data)
+        old_size = rec.size
+        new_size = max(old_size, end)
+        if off == old_size and self._try_append(rec, data):
+            return
+        if new_size <= INLINE_MAX:
+            buf = bytearray(rec.inline_data if rec.inline_len else b"")
+            if len(buf) < new_size:
+                buf += bytes(new_size - len(buf))
+            buf[off:end] = data
+            if not rec.inline_len:
+                for (st, cnt) in self.rec_extents(rec):
+                    self.free_blocks(st, cnt)
+                rec.blocks = 0
+            self._set_inline(rec, bytes(buf[:new_size]))
+            return
+        old_inline = bytes(rec.inline_data) if rec.inline_len else b""
+        exts = [] if rec.inline_len else [(st, cnt) for (st, cnt) in self.rec_extents(rec)]
+        old_blocks = ceil_div(old_size, self.bs) if old_size else 0
+        cover_lo = min(off, old_size) // self.bs
+        cover_hi = max(old_blocks, ceil_div(end, self.bs))
+        n_mid = cover_hi - cover_lo
+        start = self.alloc_blocks(n_mid)
+        if start is None:
+            raise OSError(errno.ENOSPC, "盘满（连续 %d 块分配不到）" % n_mid)
+        for i in range(n_mid):
+            base = (cover_lo + i) * self.bs
+            chunk = bytearray(self.bs)
+            if base < old_size:
+                seglen = min(self.bs, old_size - base)
+                if rec.inline_len:
+                    chunk[:seglen] = old_inline[base:base + seglen]
+                else:
+                    chunk[:seglen] = self._read_old_bytes(exts, base, seglen)
+            a = max(base, off)
+            z = min(base + self.bs, end)
+            if a < z:
+                chunk[a - base:z - base] = data[a - off:z - off]
+            self.write_data_block(start + i, bytes(chunk))
+        if rec.inline_len or not exts:
+            head, tail, free_ranges = [], [], []
+        else:
+            head, tail, free_ranges = self._split_extents(exts, cover_lo, cover_hi)
+        # 先改 record（>3 段时会分配新 ext_index 表），再释放旧块：
+        # 若先释放，新表块可能复用刚释放的旧数据块，提交前断电会破坏旧文件
+        self._set_extents(rec, head + [(start, n_mid)] + tail, new_size)
+        for (fst, fcnt) in free_ranges:
+            self.free_blocks(fst, fcnt)
+
+    def truncate_at(self, rec, size):
+        if size < 0:
+            raise OSError(errno.EINVAL, "大小为负")
+        old = rec.size
+        if size == old:
+            return
+        if size < old:
+            if size <= INLINE_MAX:
+                data = self.read_at(rec, 0, size)
+                for (st, cnt) in self.rec_extents(rec):
+                    self.free_blocks(st, cnt)
+                self._set_inline(rec, data)
+                return
+            exts = self.rec_extents(rec)
+            keep_blocks = ceil_div(size, self.bs)
+            kept, freed, pos = [], [], 0
+            for (st, cnt) in exts:
+                if pos >= keep_blocks:
+                    freed.append((st, cnt))
+                elif pos + cnt <= keep_blocks:
+                    kept.append((st, cnt))
+                else:
+                    k = keep_blocks - pos
+                    kept.append((st, k))
+                    freed.append((st + k, cnt - k))
+                pos += cnt
+            self._set_extents(rec, kept, size)      # 先建新索引表，再释放旧块
+            for (fst, fcnt) in freed:
+                self.free_blocks(fst, fcnt)
+            return
+        # 向上扩展：KiFS 没有空洞（fsck 要求 size <= blocks*block_size），补零分配
+        chunk = 1 << 20
+        while rec.size < size:
+            n = min(chunk, size - rec.size)
+            self.write_at(rec, rec.size, b"\0" * n)
+
+    # ---- 命名空间操作（FUSE 用；抛 OSError 子类，errno 语义与 POSIX 对齐） ----
+    def _new_record(self, typ, parent_oid, perm):
+        oid = self.alloc_oid()
+        r = Record()
+        r.oid, r.type = oid, typ
+        r.parent = parent_oid
+        r.perm = perm
+        r.ctime = r.mtime = int(time.time())
+        r.owner = default_owner().encode()
+        self.write_record(r)
+        self._used_recs = None
+        return r
+
+    def create_file(self, path, perm=PERM_FILE_DEFAULT):
+        parent, name = self.parent_record(path)
+        if not name:
+            raise IsADirectoryError(errno.EISDIR, "不能写根 /")
+        if self.dir_lookup(parent, name) is not None:
+            raise FileExistsError(errno.EEXIST, "已存在: %s" % path)
+        r = self._new_record(TYPE_FILE, parent.oid, perm)
+        self.dir_add(parent, name, r.oid, TYPE_FILE)
+        self.write_record(parent)
+        return r
+
+    def mkdir_at(self, path, perm=PERM_DIR_DEFAULT):
+        parent, name = self.parent_record(path)
+        if not name:
+            raise FileExistsError(errno.EEXIST, "根目录已存在")
+        if self.dir_lookup(parent, name) is not None:
+            raise FileExistsError(errno.EEXIST, "已存在: %s" % path)
+        r = self._new_record(TYPE_DIR, parent.oid, perm)
+        self.dir_add(parent, name, r.oid, TYPE_DIR)
+        self.write_record(parent)
+        return r
+
+    def _clear_record(self, rec):
+        self.record_free_data(rec)
+        rec.type = 0
+        rec.size = 0
+        rec.blocks = 0
+        rec.inline_len = 0
+        rec.inline_data = b""
+        rec.extents = []
+        rec.ext_index = 0
+        rec.n_ext = rec.n_ext_total = 0
+        self.write_record(rec)
+        self._used_recs = None
+
+    def unlink_at(self, path):
+        parent, name = self.parent_record(path)
+        oid = self.dir_lookup(parent, name)
+        if oid is None:
+            raise FileNotFoundError(errno.ENOENT, "找不到: %s" % path)
+        rec = self.read_record(oid)
+        if rec is None:
+            raise FileNotFoundError(errno.ENOENT, "找不到: %s" % path)
+        if rec.type == TYPE_DIR:
+            raise IsADirectoryError(errno.EISDIR, "是目录: %s" % path)
+        self._clear_record(rec)
+        self.dir_remove(parent, name)
+        self.write_record(parent)
+
+    def rmdir_at(self, path):
+        parent, name = self.parent_record(path)
+        oid = self.dir_lookup(parent, name)
+        if oid is None:
+            raise FileNotFoundError(errno.ENOENT, "找不到: %s" % path)
+        rec = self.read_record(oid)
+        if rec is None or rec.type != TYPE_DIR:
+            raise NotADirectoryError(errno.ENOTDIR, "不是目录: %s" % path)
+        if self.dir_entries(rec):
+            raise OSError(errno.ENOTEMPTY, "目录非空: %s" % path)
+        self._clear_record(rec)
+        self.dir_remove(parent, name)
+        self.write_record(parent)
+
+    def _is_ancestor(self, anc_oid, oid):
+        """oid 是否等于 anc_oid 或位于其子树内（沿 parent 上溯，带环保护）。"""
+        seen = set()
+        while oid and oid not in seen:
+            if oid == anc_oid:
+                return True
+            seen.add(oid)
+            rec = self.read_record(oid)
+            if rec is None:
+                return False
+            oid = rec.parent
+        return False
+
+    def rename_at(self, old, new):
+        if old == new:
+            return
+        op, on = self.parent_record(old)
+        oid = self.dir_lookup(op, on)
+        if oid is None:
+            raise FileNotFoundError(errno.ENOENT, "找不到: %s" % old)
+        orec = self.read_record(oid)
+        np, nn = self.parent_record(new)
+        if not nn:
+            raise OSError(errno.EBUSY, "不能重命名到根 /")
+        if orec.type == TYPE_DIR and self._is_ancestor(oid, np.oid):
+            raise OSError(errno.EINVAL, "不能把目录移动到自己的子树: %s" % new)
+        existing = self.dir_lookup(np, nn)
+        if existing == oid:
+            return                                  # 源和目标指向同一对象
+        if existing is not None:
+            target = self.read_record(existing)
+            if target is None:
+                raise FileNotFoundError(errno.ENOENT, "目标不存在: %s" % new)
+            if orec.type == TYPE_DIR and target.type != TYPE_DIR:
+                raise NotADirectoryError(errno.ENOTDIR, "目标不是目录: %s" % new)
+            if orec.type != TYPE_DIR and target.type == TYPE_DIR:
+                raise IsADirectoryError(errno.EISDIR, "目标是目录: %s" % new)
+            if target.type == TYPE_DIR and self.dir_entries(target):
+                raise OSError(errno.ENOTEMPTY, "目标目录非空: %s" % new)
+            self._clear_record(target)
+            if op.oid != np.oid:
+                self.dir_remove(np, nn)
+        if op.oid == np.oid:
+            entries = [(n, o, t) for (n, o, t, _e) in self.dir_entries(op)
+                       if n not in (on, nn)]
+            entries.append((nn, oid, orec.type))
+            self.dir_set_entries(op, entries)
+            self.write_record(op)
+        else:
+            self.dir_remove(op, on)
+            self.write_record(op)
+            self.dir_add(np, nn, oid, orec.type)
+            self.write_record(np)
+        orec.parent = np.oid
+        orec.ctime = int(time.time())
+        self.write_record(orec)
+
+    def chmod_at(self, path, mode):
+        rec = self.record_at(path)
+        if rec is None:
+            raise FileNotFoundError(errno.ENOENT, "找不到: %s" % path)
+        rec.perm = (rec.perm & ~0o777) | (mode & 0o777)
+        self.write_record(rec)
+
+    def utimens_at(self, path, mtime=None, ctime=None):
+        rec = self.record_at(path)
+        if rec is None:
+            raise FileNotFoundError(errno.ENOENT, "找不到: %s" % path)
+        if mtime is not None:
+            rec.mtime = int(mtime)
+        if ctime is not None:
+            rec.ctime = int(ctime)
+        self.write_record(rec)
+
 
 # ---------------------------------------------------------------------------
 # 命令
@@ -979,13 +1538,26 @@ def cmd_format(args):
     root.owner = default_owner().encode()
     root_packed = root.pack()
 
+    # 卷在设备内的字节偏移（--offset-lba / --offset）：块设备/带前缀的镜像用
+    vol_off = volume_offset(args)
+    exists = os.path.exists(args.img)
+    is_blk = exists and stat.S_ISBLK(os.stat(args.img).st_mode)
+    if is_blk or vol_off > 0:
+        if not exists:
+            raise SystemExit("带 offset 的 format 要求目标已存在（先 truncate 出空间）: %s" % args.img)
+        dev_size = device_size(args.img)
+        if vol_off + size > dev_size:
+            raise SystemExit("卷 [%d, %d) 超出设备大小 %d"
+                             % (vol_off, vol_off + size, dev_size))
+    mode = "r+b" if (vol_off > 0 or is_blk) else "wb"
     written = [0]
-    with open(args.img, "wb") as fh:
-        fh.truncate(size)                     # 数据区留稀疏空洞
+    with open(args.img, mode) as fh:
+        if vol_off == 0 and not is_blk:
+            fh.truncate(size)                 # 数据区留稀疏空洞（块设备/带前缀卷不动）
         zero = bytes(1 << 20)
 
         def w(off, data):
-            fh.seek(off)
+            fh.seek(vol_off + off)
             fh.write(data)
             written[0] += len(data)
 
@@ -1031,8 +1603,69 @@ def cmd_format(args):
     return 0
 
 
+def volume_offset(args):
+    """--offset-lba / --offset（卷在设备内的起始字节）。"""
+    if getattr(args, "offset_lba", None) is not None:
+        return args.offset_lba * 512
+    if getattr(args, "offset", None) is not None:
+        return args.offset
+    return 0
+
+
 def open_img(args):
-    return Image(args.img)
+    return Image(args.img, offset=volume_offset(args))
+
+
+def _find_fuse_python():
+    """返回能 `from fuse import FUSE` 的 python；优先仓库 .venv，其次当前解释器。
+
+    系统里可能装着 Debian 的老 fusepy（只有 Fuse 没有 FUSE），必须测真导入。
+    """
+    import subprocess
+    here = os.path.dirname(os.path.abspath(__file__))
+    cands = []
+    venv_py = os.path.join(os.path.dirname(here), ".venv", "bin", "python")
+    if os.path.exists(venv_py):
+        cands.append(venv_py)
+    cands.append(sys.executable)
+    for py in cands:
+        try:
+            rc = subprocess.call(
+                [py, "-c", "from fuse import FUSE, FuseOSError, Operations"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except OSError:
+            rc = 1
+        if rc == 0:
+            return py
+    return None
+
+
+def cmd_mount(args):
+    here = os.path.dirname(os.path.abspath(__file__))
+    drv = os.path.abspath(os.path.join(here, "..", "linux", "fuse_kifs.py"))
+    if not os.path.exists(drv):
+        raise SystemExit("找不到 FUSE 驱动: %s" % drv)
+    py = _find_fuse_python()
+    if py is None:
+        raise SystemExit(
+            "缺少 fusepy。请先：\n"
+            "  python3 -m venv %s/.venv\n"
+            "  %s/.venv/bin/pip install -r %s/linux/requirements.txt\n"
+            "然后重试（或在 .venv 里运行本脚本）。"
+            % (os.path.dirname(here), os.path.dirname(here), os.path.dirname(here)))
+    argv = [py, drv, args.img, args.mountpoint]
+    if getattr(args, "offset_lba", None) is not None:
+        argv += ["--offset-lba", str(args.offset_lba)]
+    if getattr(args, "offset", None) is not None:
+        argv += ["--offset", str(args.offset)]
+    for flag in ("read_only", "show_hidden", "foreground", "debug"):
+        if getattr(args, flag, False):
+            argv.append("--" + flag.replace("_", "-"))
+    if getattr(args, "log", None):
+        argv += ["--log", args.log]
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os.execv(py, argv)
 
 
 def cmd_mkdir(args):
@@ -1184,9 +1817,15 @@ def cmd_fsck(args):
         if img.block(bk)[:112] != img.block(1)[:112]:
             bad("superblock 备份 @块 %d 与主副本不一致" % bk)
     try:
-        if os.path.getsize(img.path) != sb.total_blocks * bs:
-            bad("镜像文件大小 %d 与 total_blocks*block_size=%d 不符" %
-                (os.path.getsize(img.path), sb.total_blocks * bs))
+        avail = img.dev_size - img.offset
+        is_blk = stat.S_ISBLK(os.stat(img.path).st_mode)
+        if img.offset == 0 and not is_blk:
+            if avail != sb.total_blocks * bs:
+                bad("镜像文件大小 %d 与 total_blocks*block_size=%d 不符" %
+                    (avail, sb.total_blocks * bs))
+        elif avail < sb.total_blocks * bs:
+            bad("设备可用 %d 字节 < total_blocks*block_size=%d" %
+                (avail, sb.total_blocks * bs))
     except OSError:
         pass
 
@@ -1401,6 +2040,13 @@ def cmd_journal(args):
     return 0
 
 
+def add_offset_args(p):
+    """给命令加 --offset-lba / --offset（卷在块设备/包裹文件内的起始位置）。"""
+    g = p.add_mutually_exclusive_group()
+    g.add_argument("--offset-lba", type=int, default=None)
+    g.add_argument("--offset", type=int, default=None)
+
+
 def main():
     ap = argparse.ArgumentParser(description="KiFS v2 宿主工具")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -1412,33 +2058,48 @@ def main():
                    choices=list(BLOCK_SIZES))
     p.add_argument("--label", default="KKIFS")
     p.add_argument("--record-cap", type=int, default=None)
+    add_offset_args(p)
     p.set_defaults(func=cmd_format)
 
+    p = sub.add_parser("mount")
+    p.add_argument("img"); p.add_argument("mountpoint")
+    g = p.add_mutually_exclusive_group()
+    g.add_argument("--offset-lba", type=int, default=None)
+    g.add_argument("--offset", type=int, default=None)
+    p.add_argument("--read-only", action="store_true")
+    p.add_argument("--show-hidden", action="store_true")
+    p.add_argument("--foreground", action="store_true")
+    p.add_argument("--debug", action="store_true")
+    p.add_argument("--log", default=None)
+    p.set_defaults(func=cmd_mount)
+
     p = sub.add_parser("mkdir"); p.add_argument("img"); p.add_argument("path")
-    p.add_argument("--perm", default=None); p.set_defaults(func=cmd_mkdir)
+    p.add_argument("--perm", default=None); add_offset_args(p); p.set_defaults(func=cmd_mkdir)
 
     p = sub.add_parser("write"); p.add_argument("img"); p.add_argument("path")
     p.add_argument("--data", default=None); p.add_argument("--from", dest="src", default=None)
-    p.add_argument("--perm", default=None); p.set_defaults(func=cmd_write)
+    p.add_argument("--perm", default=None); add_offset_args(p); p.set_defaults(func=cmd_write)
 
     p = sub.add_parser("read"); p.add_argument("img"); p.add_argument("path")
-    p.add_argument("--out", default=None); p.set_defaults(func=cmd_read)
+    p.add_argument("--out", default=None); add_offset_args(p); p.set_defaults(func=cmd_read)
 
     p = sub.add_parser("ls"); p.add_argument("img"); p.add_argument("path", nargs="?", default=None)
-    p.set_defaults(func=cmd_ls)
+    add_offset_args(p); p.set_defaults(func=cmd_ls)
 
     p = sub.add_parser("stat"); p.add_argument("img"); p.add_argument("path")
-    p.set_defaults(func=cmd_stat)
+    add_offset_args(p); p.set_defaults(func=cmd_stat)
 
     p = sub.add_parser("journal"); p.add_argument("img")
-    p.set_defaults(func=cmd_journal)
+    add_offset_args(p); p.set_defaults(func=cmd_journal)
 
     p = sub.add_parser("rm"); p.add_argument("img"); p.add_argument("path")
-    p.set_defaults(func=cmd_rm)
+    add_offset_args(p); p.set_defaults(func=cmd_rm)
 
-    p = sub.add_parser("info"); p.add_argument("img"); p.set_defaults(func=cmd_info)
+    p = sub.add_parser("info"); p.add_argument("img")
+    add_offset_args(p); p.set_defaults(func=cmd_info)
 
-    p = sub.add_parser("fsck"); p.add_argument("img"); p.set_defaults(func=cmd_fsck)
+    p = sub.add_parser("fsck"); p.add_argument("img")
+    add_offset_args(p); p.set_defaults(func=cmd_fsck)
 
     args = ap.parse_args()
     sys.exit(args.func(args) or 0)
