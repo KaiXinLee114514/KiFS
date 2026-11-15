@@ -363,7 +363,7 @@ test_symlink() {
 
     mount_kifs "$img" "$mnt" || die "挂载失败"
     ln -s target.txt "$mnt/dir/link" || die "ln -s 相对链接失败"
-    ln -s /dir "$mnt/dir/dirlink" || die "ln -s 目录链接失败"
+    ln -s . "$mnt/dir/dirlink" || die "ln -s 目录链接失败"
     ln -s /nonexistent/x "$mnt/dir/dangling" || die "ln -s dangling 失败"
     ln -s "$long_t" "$mnt/dir/longlink" || die "ln -s 长目标失败"
     [ "$(readlink "$mnt/dir/link")" = "target.txt" ] || die "readlink 结果不对"
