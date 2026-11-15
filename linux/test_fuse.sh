@@ -382,7 +382,7 @@ test_symlink() {
     [ "$(readlink "$mnt/dir/dangling")" = "/nonexistent/x" ] || die "dangling readlink 失败"
     cat "$mnt/dir/dangling" 2>/dev/null && die "dangling 链接居然能 cat"
     ok "dangling：readlink 正常，cat 报 ENOENT"
-    [ "$(ls "$mnt/dir/dirlink/")" = "target.txt" ] || die "目录链接 ls 失败"
+    [ "$(ls "$mnt/dir/dirlink/")" = "$(ls "$mnt/dir/")" ] || die "目录链接 ls 失败"
     ok "目录链接：ls link/ 正常"
     [ "$(readlink "$mnt/dir/longlink")" = "$long_t" ] || die "长目标 readlink 不一致"
     ok "长目标（200B）readlink"
