@@ -1,87 +1,98 @@
 ; ============================================================================
-;  kernel/kifs.asm — KiFS 只读驱动(Phase B0)
+;  kernel/kifs.asm — KiFS v2 内核驱动(读 + 写,journal + CoW)
 ;
-;  KiFS 是 KKernel 自己的文件系统(设计文档在 kifs 仓库 docs/kifs.md,
-;  宿主工具 tools/mkifs.py 生成/检查镜像、fsck 当标准答案)。Phase B0 只做
-;  **内核侧只读挂载**,命令组:
+;  KiFS 是 KKernel 自己的文件系统(设计文档在 kifs 仓库 docs/kifs-v2.md,
+;  宿主工具 tools/mkifs.py 生成/检查镜像、fsck 当标准答案)。命令组:
 ;
 ;      kifs info              看 superblock:magic/version/块大小/总块数/
 ;                             root_oid/free_blocks/卷标
 ;      kifs ls [path]         列目录(省略路径 = 根目录 /)
-;      kifs cat <path>        打印文件内容(内联 / 单段多块 extent)
+;      kifs cat <path>        流式打印文件内容(内联 / extent)
 ;      kifs stat <path>       oid / 类型 / 权限 / 大小 / 块数 / 内联长度 /
 ;                             extent / 父 oid
+;      kifs mkdir <path>      建目录
+;      kifs write <path> ...  写文件(文本参数或管道 stdin)
+;      kifs rm <path>         删文件 / 空目录
+;      kifs journal           列 journal 事务
 ;
-;  为什么固定 LBA 而不是自动探测:Phase B0 是"先让内核能读一致格式"的
-;  最小闭环,分区位置和宿主测试镜像焊死(22528 = 11 MiB),省掉挂载表、
-;  分区表解析和 VFS 层;Phase B1 再谈 /MNT/KIFS。**没挂 VFS,只读**,
-;  和 FAT16 命令各读各的分区,互不影响。
+;  v2 关键变化(相对 v1):
+;    - version = 0x00020000;block_size 4096 / 16384 从 superblock 读,
+;      块 LBA 用 64 位(ata_read_sectors48 / ata_write_sectors48)。
+;    - record 的 size / blocks 是 u64(size_lo@8 + size_hi@100,
+;      blocks_lo@12 + blocks_hi@104);extent 每项 12 B = (start u64, count u32)。
+;    - 内联文件:inline_len>0 时 record 36..127 整段是数据,size=inline_len、
+;      blocks=0,owner/size_hi/blocks_hi 都不存在,禁止解析。
+;    - journal payload = block_size - 20。
 ;
-;  静默原则:普通镜像 / 软盘 / FAT 盘上这个位置没有 KiFS(或校验不过),
-;  kifs_init 一声不吭地返回,kifs_ok=0;现有测试一个都不受影响。
+;  分区固定 LBA 22528(11 MiB)起,不解析分区表、不挂 VFS。盘上没有合法
+;  KiFS 卷时 kifs_init 静默返回(kifs_ok=0),不影响其他文件系统。
+;  KIFS_PART_LBA 可以用 nasm -D 覆盖(test-kifs-big 用高地址卷)。
 ;
-;  内存(0x3C3000-0x3C5FFF,与 kmain.asm 顶部布局表同步;0x3C2000 之后
-;  到 0x3C2FFF 是 usbdisk 的 4 KiB 数据缓冲,别越界):
-;      0x3C3000  4 KiB 块缓冲(ATA 读盘目标)
-;      0x3C4000  4 KiB 目录内容缓冲
-;      0x3C5000  128 B 当前 record
-;      0x3C5100  256 B 路径缓冲
-;      全局变量在下面数据段(内核映像里,可写)
+;  内存(0x3C6000-0x3FFFFF 里挑的;0x3C2000-0x3C2FFF 是 usbdisk 的 4 KiB
+;  数据缓冲,0x3D0000-0x3D1FFF 是 pmem 页池位图,都别踩):
+;      0x3C6000  16 KiB 块缓冲(ATA 读盘目标)
+;      0x3CA000  16 KiB journal 块构建 / 目标块暂存
+;      0x3D2000  4 KiB 目录内容缓冲
+;      0x3D3000  128 B 当前 record
+;      0x3D3100  256 B 路径缓冲
+;      0x3E0000  16 KiB 位图块缓存
+;      0x3E4000  32 KiB 写入数据 / 目录内容 staging
+;      0x3EC000  superblock 影子 / delta 表 / 事务表
 ;
 ;  磁盘布局(全部小端;权威实现:宿主 tools/mkifs.py):
-;    superblock(512 B;主副本在**分区块 1** —— 块 0 是引导块留空,
-;      设计文档写的是"块 0",但权威实现 mkifs.py 是块 1,以 py 为准):
-;      magic 'KIFS'@0(0x5346494B), version 0x00010000@4, block_size 4096@8,
+;    superblock(主副本在分区块 1,备份块 2 和最后一块):
+;      magic 'KIFS'@0, version 0x00020000@4, block_size@8,
 ;      total_blocks@12, data_start@20, data_next@24, meta_next@28,
-;      record_start@40, record_count@44, root_oid@48, free_blocks@52,
+;      journal_start@32, journal_blocks@36, record_start@40,
+;      record_count@44, root_oid@48, free_blocks@52,
 ;      flags@56, uuid@60(16 B), label@76(32 B),
-;      checksum = crc32(前 108 字节)@108,其余补 0
-;      备份副本在块 2 和最后一块(本驱动只读块 1,不信备份)
-;    record 128 B(record 表从块 record_start 起,第 oid 个在 +oid*128):
+;      checksum = crc32(前 108 字节)@108
+;    record 128 B:
 ;      oid@0, type@4(1=文件 2=目录), flags@5, perm@6,
-;      size@8, blocks@12, parent@16, ctime@20, mtime@24, kw_index@28,
-;      n_ext@32, inline_len@33, inline_off@34,
-;      extents@36(3 × 12 B:start u32 / count u16 / pad u16),
-;      ext_index@72, n_ext_total@76, next_free_oid@80, owner@84(16 B)
-;      内联数据从 inline_off(36)起,最多 92 B;内联时 extent 区不能读
-;      —— v0 宿主工具把 36..128 整段留给内联数据,owner/extent 都被盖住
+;      size_lo@8, blocks_lo@12, parent@16, ctime@20, mtime@24,
+;      kw_index@28, n_ext@32, inline_len@33, inline_off@34,
+;      extents@36(3 × 12 B:start u64 @0 / count u32 @8),
+;      ext_index@72, n_ext_total@76, next_free_oid@80, owner@84(16 B),
+;      size_hi@100, blocks_hi@104
 ;    目录内容 = 一串目录项:oid u32@0, type u8@4, name_len u8@5,
 ;      entry_len u16@6,名字 UTF-8@8,entry_len 4 对齐,按名字字节序排
 ;    perm 16 位:bit0-2 owner rwx,bit3-5 group,bit6-8 other,
-;      bit9 hide,bit10 ro,bit11 iolock(只读驱动:只展示,不校验)
-;
-;  只读:本文件没有一个 ata_write_sectors 调用(故意的)。
+;      bit9 hide,bit10 ro,bit11 iolock(只展示,不强制)
 ; ============================================================================
 
 ; ---------------------------------------------------------------------------
 ;  常量 / 固定缓冲
 ; ---------------------------------------------------------------------------
-KIFS_PART_LBA     equ 22528              ; KiFS 分区固定起点(11 MiB / 8 = LBA 22528)
+%ifndef KIFS_PART_LBA
+%define KIFS_PART_LBA 22528              ; 默认分区起点(11 MiB);-D 可覆盖
+%endif
 KIFS_MAGIC        equ 0x5346494B         ; dword 'KIFS'(小端)
-KIFS_VERSION      equ 0x00010000
-KIFS_BLOCK_SIZE   equ 4096
-KIFS_BLOCK_SECTORS equ KIFS_BLOCK_SIZE / 512
-KIFS_INLINE_OFF   equ 36                 ; v0 宿主工具固定内联数据偏移
+KIFS_VERSION      equ 0x00020000
+KIFS_BLOCK_SIZE_MAX equ 16384
+KIFS_INLINE_OFF   equ 36                 ; v2 内联数据固定偏移
 KIFS_INLINE_MAX   equ 92
 KIFS_REC_SIZE     equ 128
-KIFS_DIR_MAX      equ 4096               ; Phase B0:目录内容最大 4 KiB(单块)
-KIFS_CAT_MAX      equ 61440              ; Phase B0:cat 上限 60 KiB(流式,不落大缓冲)
+KIFS_DIR_MAX      equ 4096               ; 目录内容最大 4 KiB(单块)
+KIFS_CAT_MAX      equ 61440              ; 仅保留旧错误文案,cat 已流式不再限制
 
-; Phase C1 写入驱动
-KIFS_DATA_MAX       equ 32768              ; 单文件上限(32 KiB)
-KIFS_BITMAP_BUF     equ 0x3C6000           ; 位图块缓存(4 KiB)
-KIFS_JRN_BUF        equ 0x3C7000           ; journal 块构建 / 目标块暂存
-KIFS_DATA_BUF       equ 0x3C8000           ; 写入数据 / 目录内容 staging(32 KiB)
-KIFS_SB_BUF         equ 0x3D2000           ; superblock 影子(512 B)
-KIFS_DELTAS         equ 0x3D2200           ; delta 表 16 × 144 B
+; 写入驱动
+KIFS_DATA_MAX       equ 32768              ; 单次 write 数据上限(32 KiB)
+KIFS_IO_BUF         equ 0x3C6000           ; 16 KiB 块缓冲
+KIFS_JRN_BUF        equ 0x3CA000           ; 16 KiB journal 块 / 目标块暂存
+KIFS_DIR_BUF        equ 0x3D2000           ; 4 KiB 目录内容缓冲
+KIFS_REC_BUF        equ 0x3D3000           ; 128 B 当前 record
+KIFS_PATH_BUF       equ 0x3D3100           ; 256 B 路径缓冲
+KIFS_BITMAP_BUF     equ 0x3E0000           ; 16 KiB 位图块缓存
+KIFS_DATA_BUF       equ 0x3E4000           ; 32 KiB 写入数据 / 目录 staging
+KIFS_SB_BUF         equ 0x3EC000           ; superblock 影子(512 B)
+KIFS_DELTAS         equ 0x3EC200           ; delta 表 16 × 144 B
 KIFS_DELTA_MAX      equ 16
-KIFS_REC2_BUF       equ 0x3D2B00           ; 第二条 record 暂存
-KIFS_PARENT_BUF     equ 0x3D2B80           ; 父路径(256 B)
-KIFS_SB_OLD         equ 0x3D2C80           ; 上次提交的 sb 前 112 B
-KIFS_TXN            equ 0x3D2D00           ; 事务表 64 × 20 B
+KIFS_REC2_BUF       equ 0x3ECB00           ; 第二条 record 暂存
+KIFS_PARENT_BUF     equ 0x3ECB80           ; 父路径(256 B)
+KIFS_SB_OLD         equ 0x3ECC80           ; 上次提交的 sb 前 112 B
+KIFS_TXN            equ 0x3ECD00           ; 事务表 64 × 20 B
 KIFS_TXN_MAX        equ 64
 KIFS_JRN_MAGIC      equ 0x4E524A4B         ; 'KJRN'
-KIFS_JRN_PAYLOAD    equ 4076               ; 4096 - 20
 KIFS_JF_VALID       equ 1
 KIFS_JF_BEGIN       equ 2
 KIFS_JF_COMMIT      equ 4
@@ -98,11 +109,6 @@ KIFS_ERR_TOOBIG     equ 11
 KIFS_ERR_RECFULL    equ 12
 KIFS_ERR_JRNFULL    equ 13
 KIFS_ERR_WRITEERR   equ 14
-
-KIFS_IO_BUF       equ 0x3C3000           ; 4 KiB 块缓冲
-KIFS_DIR_BUF      equ 0x3C4000           ; 4 KiB 目录内容缓冲
-KIFS_REC_BUF      equ 0x3C5000           ; 128 B 当前 record
-KIFS_PATH_BUF     equ 0x3C5100           ; 256 B 路径缓冲
 
 ; kifs_err 错误码(命令层翻译成人话)
 KIFS_ERR_NONE     equ 0
@@ -146,17 +152,29 @@ kifs_crc32:
     pop ebx
     ret
 
+; 块号 → LBA48(edx:eax = KIFS_PART_LBA + block * block_sectors)
+%macro kifs_block_lba 1
+    mov eax, %1
+    mov edx, eax
+    mov ecx, [kifs_block_shift]
+    shl eax, cl
+    mov ecx, 32
+    sub ecx, [kifs_block_shift]
+    shr edx, cl
+    add eax, KIFS_PART_LBA
+    adc edx, 0
+%endmacro
+
 ; ===========================================================================
 ;  kifs_read_block:eax = 块号 → 读进 KIFS_IO_BUF;返回 eax = 0 / -1
-;  块 LBA = 22528 + 块号 × 8(4096 B = 8 扇区)
+;  块 LBA = KIFS_PART_LBA + 块号 × block_sectors(v2:4K/16K 运行时定)
 ; ===========================================================================
 kifs_read_block:
     pushad
-    shl eax, 3                            ; 块号 → 扇区偏移
-    add eax, KIFS_PART_LBA
-    mov ecx, KIFS_BLOCK_SECTORS
+    kifs_block_lba eax
+    mov ecx, [kifs_block_sectors]
     mov edi, KIFS_IO_BUF
-    call ata_read_sectors                 ; eax=0 成功 / -1 失败,其它寄存器不动
+    call ata_read_sectors48
     mov [kifs_rb_ret], eax
     popad
     mov eax, [kifs_rb_ret]
@@ -164,8 +182,8 @@ kifs_read_block:
 
 ; ===========================================================================
 ;  kifs_read_record:eax = oid, edi = 128 B 目标 → eax = 0 / -1
-;  oid 合法范围 1..record_count-1;record 在块 record_start + oid/32,
-;  块内偏移 (oid & 31) * 128
+;  oid 合法范围 1..record_count-1;record 在块 record_start + oid/records_per_block,
+;  块内偏移 (oid % records_per_block) * 128
 ;  (保留寄存器;内部用 KIFS_IO_BUF 做块缓冲,调用者别同时指望它的内容)
 ; ===========================================================================
 kifs_read_record:
@@ -176,17 +194,21 @@ kifs_read_record:
     jae .fail
     test eax, eax
     jz .fail
-    ; 块号 = record_start + oid/32
+    ; 块号 = record_start + oid / records_per_block(4K:32,16K:128)
     mov edx, eax
-    shr edx, 5
+    mov ecx, [kifs_rec_shift]
+    shr edx, cl
     add edx, [kifs_record_start]
     mov eax, edx
     call kifs_read_block
     test eax, eax
     jnz .fail
-    ; 块内偏移 = (oid & 31) * 128
-    mov eax, [kifs_rr_oid]
-    and eax, 31
+    ; 块内偏移 = (oid & (records_per_block-1)) * 128
+    mov ecx, [kifs_rec_shift]
+    mov eax, 1
+    shl eax, cl
+    dec eax
+    and eax, [kifs_rr_oid]
     shl eax, 7
     add eax, KIFS_IO_BUF
     mov esi, eax
@@ -220,12 +242,10 @@ kifs_read_content:
     movzx eax, byte [esi + 33]            ; inline_len
     test eax, eax
     jz .extents
-    ; 内联边界自洽:inline_off + inline_len 不能越过 record
     movzx edx, word [esi + 34]            ; inline_off
     lea ebx, [eax + edx]
     cmp ebx, KIFS_REC_SIZE
     ja .fail
-    ; n = min(inline_len, max)
     cmp eax, [kifs_rc_max]
     jbe .inline_n_ok
     mov eax, [kifs_rc_max]
@@ -241,11 +261,15 @@ kifs_read_content:
     mov eax, [kifs_rc_n]
     jmp .out
 .extents:
-    ; 目标读取长度 = min(size, max)
+    ; 目标读取长度 = min(size, max);size 是 u64,但 max 只有 32 位
     mov esi, [kifs_rc_rec]
-    mov eax, [esi + 8]                    ; size
+    mov eax, [esi + 100]                  ; size_hi
+    test eax, eax
+    jnz .size_max
+    mov eax, [esi + 8]                    ; size_lo
     cmp eax, [kifs_rc_max]
     jbe .size_ok
+.size_max:
     mov eax, [kifs_rc_max]
 .size_ok:
     mov [kifs_rc_left], eax
@@ -259,14 +283,14 @@ kifs_read_content:
     je .ext_done
     cmp dword [kifs_rc_ne], 0
     je .ext_done
-    ; extent[i] 在 record + 36 + i*12
+    ; extent[i] 在 record + 36 + i*12;start u64@0,count u32@8
     mov eax, [kifs_rc_exti]
     imul eax, eax, 12
     mov esi, [kifs_rc_rec]
     lea esi, [esi + eax + 36]
-    mov eax, [esi]                        ; start 块
+    mov eax, [esi]                        ; start 低 32 位
     mov [kifs_rc_blk], eax
-    movzx eax, word [esi + 4]             ; 块数
+    mov eax, [esi + 8]                    ; 块数
     mov [kifs_rc_bcnt], eax
 .blk_loop:
     cmp dword [kifs_rc_left], 0
@@ -278,9 +302,9 @@ kifs_read_content:
     test eax, eax
     jnz .fail
     mov ecx, [kifs_rc_left]
-    cmp ecx, KIFS_BLOCK_SIZE
+    cmp ecx, [kifs_block_size]
     jbe .chunk_ok
-    mov ecx, KIFS_BLOCK_SIZE
+    mov ecx, [kifs_block_size]
 .chunk_ok:
     mov [kifs_rc_n], ecx
     mov esi, KIFS_IO_BUF
@@ -486,10 +510,8 @@ kifs_print_perm:
 ; ===========================================================================
 kifs_print_owner:
     pushad
-    cmp byte [esi + 33], 0                ; inline_len
-    je .print
-    cmp byte [esi + 33], 48
-    ja .out                               ; owner 区被内联数据盖住,不显示
+    cmp byte [esi + 33], 0                ; inline_len > 0 → 36..127 全是数据
+    jne .out                              ; owner 区被内联数据盖住,不显示
 .print:
     lea esi, [esi + 84]
     xor ebx, ebx
@@ -675,6 +697,36 @@ kifs_init:
     popad
     ret
 ; ===========================================================================
+;  kifs_print_dec64:edx:eax = 64 位无符号数 → 十进制打印
+; ===========================================================================
+kifs_print_dec64:
+    pushad
+    xor edi, edi
+.loop:
+    mov ecx, 10
+    mov ebp, eax
+    mov eax, edx
+    xor edx, edx
+    div ecx
+    mov ebx, eax
+    mov eax, ebp
+    div ecx
+    push edx
+    inc edi
+    mov edx, ebx
+    mov ecx, eax
+    or ecx, edx
+    jnz .loop
+.print:
+    pop eax
+    add al, '0'
+    call term_putc
+    dec edi
+    jnz .print
+    popad
+    ret
+
+; ===========================================================================
 ;  cmd_kifs — shell 命令入口
 ;    kifs info / kifs ls [path] / kifs cat <path> / kifs stat <path>
 ;  没镜像时只打一句提示(规格要求的固定文案),不碰 FAT 状态。
@@ -694,6 +746,10 @@ cmd_kifs:
     call term_set_color
     mov esi, msg_kifs_noimg
     call term_print
+    mov eax, KIFS_PART_LBA
+    call term_print_dec
+    mov al, 10
+    call term_putc
     mov al, COL_NORMAL
     call term_set_color
     jmp .done
@@ -760,6 +816,10 @@ cmd_kifs:
     call term_set_color
     mov esi, msg_kifs_info_head
     call term_print
+    mov eax, KIFS_PART_LBA
+    call term_print_dec
+    mov al, 10
+    call term_putc
     mov al, COL_NORMAL
     call term_set_color
     ; magic + version + block_size
@@ -869,7 +929,12 @@ cmd_kifs:
     jmp .ls_size_done
 .ls_size_file:
     mov eax, [KIFS_REC_BUF + 8]
-    call term_print_dec
+    xor edx, edx
+    cmp byte [KIFS_REC_BUF + 33], 0
+    jne .ls_size_print
+    mov edx, [KIFS_REC_BUF + 100]
+.ls_size_print:
+    call kifs_print_dec64
 .ls_size_done:
     mov al, ' '
     call term_putc
@@ -914,9 +979,6 @@ cmd_kifs:
     jnz .err_io
     cmp byte [KIFS_REC_BUF + 4], 1        ; 必须是文件
     jne .err_notfile
-    mov eax, [KIFS_REC_BUF + 8]
-    cmp eax, KIFS_CAT_MAX
-    ja .err_filebig
     mov byte [kifs_cat_last], 0
     mov dword [kifs_cat_printed], 0
     ; ---- 内联?先整段读到 IO 缓冲再逐字节打(最多 92 B)----
@@ -943,35 +1005,41 @@ cmd_kifs:
     jmp .cat_end
 .cat_ext:
     mov eax, [KIFS_REC_BUF + 8]
-    mov [kifs_cat_left], eax
+    mov [kifs_cat_left_lo], eax
+    mov eax, [KIFS_REC_BUF + 100]         ; size_hi
+    mov [kifs_cat_left_hi], eax
     movzx eax, byte [KIFS_REC_BUF + 32]   ; n_ext
     mov [kifs_cat_ne], eax
     mov dword [kifs_cat_exti], 0
 .cat_ext_loop:
-    cmp dword [kifs_cat_left], 0
-    je .cat_end
+    mov eax, [kifs_cat_left_lo]
+    or eax, [kifs_cat_left_hi]
+    jz .cat_end
     cmp dword [kifs_cat_ne], 0
     je .cat_end
     mov eax, [kifs_cat_exti]
     imul eax, eax, 12
     lea esi, [KIFS_REC_BUF + eax + 36]
-    mov eax, [esi]                        ; start 块
+    mov eax, [esi]                        ; start 低 32 位
     mov [kifs_cat_blk], eax
-    movzx eax, word [esi + 4]             ; 块数
+    mov eax, [esi + 8]                    ; 块数
     mov [kifs_cat_bcnt], eax
 .cat_block_loop:
-    cmp dword [kifs_cat_left], 0
-    je .cat_end
+    mov eax, [kifs_cat_left_lo]
+    or eax, [kifs_cat_left_hi]
+    jz .cat_end
     cmp dword [kifs_cat_bcnt], 0
     je .cat_next_ext
     mov eax, [kifs_cat_blk]
     call kifs_read_block
     test eax, eax
     jnz .err_io
-    mov ecx, [kifs_cat_left]
-    cmp ecx, KIFS_BLOCK_SIZE
-    jbe .cat_chunk_ok
-    mov ecx, KIFS_BLOCK_SIZE
+    mov ecx, [kifs_block_size]
+    cmp dword [kifs_cat_left_hi], 0
+    jne .cat_chunk_ok
+    cmp [kifs_cat_left_lo], ecx
+    jae .cat_chunk_ok
+    mov ecx, [kifs_cat_left_lo]
 .cat_chunk_ok:
     mov [kifs_cat_n], ecx
     mov esi, KIFS_IO_BUF
@@ -984,7 +1052,8 @@ cmd_kifs:
     dec ecx
     jnz .cat_print_loop
     mov eax, [kifs_cat_n]
-    sub [kifs_cat_left], eax
+    sub [kifs_cat_left_lo], eax
+    sbb dword [kifs_cat_left_hi], 0
     inc dword [kifs_cat_blk]
     dec dword [kifs_cat_bcnt]
     jmp .cat_block_loop
@@ -1050,18 +1119,28 @@ cmd_kifs:
     call kifs_print_owner
     mov al, 10
     call term_putc
-    ; size
+    ; size(u64;内联时 size_hi 在数据区,不能读)
     mov esi, msg_kifs_stat_size
     call term_print
     mov eax, [KIFS_REC_BUF + 8]
-    call term_print_dec
+    xor edx, edx
+    cmp byte [KIFS_REC_BUF + 33], 0
+    jne .st_size_print
+    mov edx, [KIFS_REC_BUF + 100]
+.st_size_print:
+    call kifs_print_dec64
     mov esi, msg_kifs_bytes
     call term_print
     ; blocks + inline_len
     mov esi, msg_kifs_stat_blocks
     call term_print
     mov eax, [KIFS_REC_BUF + 12]
-    call term_print_dec
+    xor edx, edx
+    cmp byte [KIFS_REC_BUF + 33], 0
+    jne .st_blocks_print
+    mov edx, [KIFS_REC_BUF + 104]
+.st_blocks_print:
+    call kifs_print_dec64
     mov esi, msg_kifs_stat_inline
     call term_print
     movzx eax, byte [KIFS_REC_BUF + 33]
@@ -1084,14 +1163,15 @@ cmd_kifs:
     mov eax, [kifs_st_i]
     imul eax, eax, 12
     lea esi, [KIFS_REC_BUF + eax + 36]
-    mov eax, [esi]
-    call term_print_dec
+    mov eax, [esi]                        ; start 低 32 位
+    mov edx, [esi + 4]                    ; start 高 32 位
+    call kifs_print_dec64
     mov esi, msg_kifs_stat_ext_blocks
     call term_print
     mov eax, [kifs_st_i]
     imul eax, eax, 12
-    lea esi, [KIFS_REC_BUF + eax + 40]
-    movzx eax, word [esi]
+    lea esi, [KIFS_REC_BUF + eax + 44]    ; count u32
+    mov eax, [esi]
     call term_print_dec
     inc dword [kifs_st_i]
     jmp .st_ext_loop
@@ -1171,24 +1251,24 @@ cmd_kifs:
 ; ---------------------------------------------------------------------------
 kifs_read_block_to:
     push ecx
-    mov ecx, eax
-    shl eax, 3
-    add eax, KIFS_PART_LBA
-    mov ecx, KIFS_BLOCK_SECTORS
-    call ata_read_sectors
+    push edx
+    kifs_block_lba eax
+    mov ecx, [kifs_block_sectors]
+    call ata_read_sectors48
+    pop edx
     pop ecx
     ret
 
 ; ---------------------------------------------------------------------------
-;  kifs_write_block:eax = 块号,esi = 4096 B 源 → eax = 0 / -1
+;  kifs_write_block:eax = 块号,esi = 块缓冲源 → eax = 0 / -1
 ; ---------------------------------------------------------------------------
 kifs_write_block:
     push ecx
-    mov ecx, eax
-    shl eax, 3
-    add eax, KIFS_PART_LBA
-    mov ecx, KIFS_BLOCK_SECTORS
-    call ata_write_sectors
+    push edx
+    kifs_block_lba eax
+    mov ecx, [kifs_block_sectors]
+    call ata_write_sectors48
+    pop edx
     pop ecx
     ret
 
@@ -1386,8 +1466,8 @@ kifs_free_rec_data:
     mov ecx, eax
     imul ecx, ecx, 12
     lea edi, [esi + ecx + 36]
-    mov eax, [edi]
-    movzx ecx, word [edi + 4]
+    mov eax, [edi]                        ; start 低 32 位
+    mov ecx, [edi + 8]                    ; count u32
     test ecx, ecx
     jz .next
     call kifs_free_blocks_range
@@ -1398,7 +1478,7 @@ kifs_free_rec_data:
     mov esi, [kifs_fd_rec]
     mov byte [esi + 32], 0
     mov byte [esi + 33], 0
-    mov byte [esi + 76], 0
+    mov dword [esi + 76], 0
     lea edi, [esi + 36]
     xor eax, eax
     mov ecx, 9                             ; extents 3 × 12 B
@@ -1496,11 +1576,15 @@ kifs_write_record:
     jae .out
     test eax, eax
     jz .out
+    mov ecx, [kifs_rec_shift]
     mov edx, eax
-    and edx, 31
+    mov ebx, 1
+    shl ebx, cl
+    dec ebx
+    shr eax, cl                            ; 所在块
+    and edx, ebx
     shl edx, 7                             ; 块内偏移
-    shr eax, 5
-    add eax, [kifs_record_start]           ; 所在块
+    add eax, [kifs_record_start]
     mov ecx, KIFS_REC_SIZE
     mov esi, [kifs_wr_rec]
     call kifs_delta_add_small
@@ -1557,7 +1641,7 @@ kifs_write_content:
     lea edi, [esi + ecx + 36]
     mov eax, [edi]
     mov [kifs_wc_ostart + ebx * 4], eax
-    movzx eax, word [edi + 4]
+    mov eax, [edi + 8]
     mov [kifs_wc_ocnt + ebx * 4], eax
     inc ebx
     jmp .old_loop
@@ -1565,17 +1649,19 @@ kifs_write_content:
     mov ecx, [kifs_wc_len]
     cmp ecx, KIFS_INLINE_MAX
     ja .extent
-    ; ---- 内联:释放旧块,改写内联区 ----
+    ; ---- 内联:释放旧块,改写内联区(36..127 整段是数据)----
     call kifs_wc_free_old
     mov esi, [kifs_wc_rec]
     mov eax, [kifs_wc_len]
-    mov [esi + 8], eax                     ; size
-    mov dword [esi + 12], 0                ; blocks
+    mov [esi + 8], eax                     ; size_lo
+    mov dword [esi + 100], 0               ; size_hi(紧接着会被内联数据覆盖)
+    mov dword [esi + 12], 0                ; blocks_lo
+    mov dword [esi + 104], 0               ; blocks_hi
     mov byte [esi + 32], 0                 ; n_ext
     mov [esi + 33], al                     ; inline_len
     mov word [esi + 34], KIFS_INLINE_OFF
     mov dword [esi + 72], 0                ; ext_index
-    mov byte [esi + 76], 0                 ; n_ext_total
+    mov dword [esi + 76], 0                ; n_ext_total
     lea edi, [esi + 36]
     mov esi, [kifs_wc_data]
     mov ecx, [kifs_wc_len]
@@ -1588,10 +1674,13 @@ kifs_write_content:
     rep stosb                              ; 补齐到 92 B
     jmp .ok
 .extent:
-    ; ---- 连续块 CoW ----
+    ; ---- 连续块 CoW(块大小运行时定)----
     mov eax, [kifs_wc_len]
-    add eax, KIFS_BLOCK_SIZE - 1
-    shr eax, 12
+    mov ecx, [kifs_block_size]
+    dec ecx
+    add eax, ecx
+    xor edx, edx
+    div dword [kifs_block_size]
     mov [kifs_wc_blocks], eax
     mov ecx, eax
     call kifs_alloc_blocks
@@ -1605,7 +1694,7 @@ kifs_write_content:
     jae .wr_done
     mov esi, [kifs_wc_data]
     mov ecx, eax
-    shl ecx, 12
+    imul ecx, [kifs_block_size]
     add esi, ecx
     mov eax, [kifs_wc_start]
     add eax, [kifs_wc_i]
@@ -1618,18 +1707,19 @@ kifs_write_content:
     call kifs_wc_free_old
     mov esi, [kifs_wc_rec]
     mov eax, [kifs_wc_len]
-    mov [esi + 8], eax                     ; size
+    mov [esi + 8], eax                     ; size_lo
+    mov dword [esi + 100], 0               ; size_hi
     mov eax, [kifs_wc_blocks]
-    mov [esi + 12], eax                    ; blocks
+    mov [esi + 12], eax                    ; blocks_lo
+    mov dword [esi + 104], 0               ; blocks_hi
     mov byte [esi + 32], 1                 ; n_ext
     mov byte [esi + 33], 0                 ; inline_len
     mov word [esi + 34], KIFS_INLINE_OFF
     mov eax, [kifs_wc_start]
-    mov [esi + 36], eax
+    mov [esi + 36], eax                    ; extent[0].start 低 32 位
+    mov dword [esi + 40], 0                ; extent[0].start 高 32 位
     mov eax, [kifs_wc_blocks]
-    mov [esi + 40], ax
-    mov word [esi + 42], 0
-    mov dword [esi + 44], 0
+    mov [esi + 44], eax                    ; extent[0].count u32
     mov dword [esi + 48], 0                ; extent[1]
     mov dword [esi + 52], 0
     mov dword [esi + 56], 0
@@ -1637,7 +1727,7 @@ kifs_write_content:
     mov dword [esi + 64], 0
     mov dword [esi + 68], 0
     mov dword [esi + 72], 0                ; ext_index
-    mov byte [esi + 76], 1                 ; n_ext_total
+    mov dword [esi + 76], 1                ; n_ext_total
     jmp .ok
 .nospc:
     mov dword [kifs_err], KIFS_ERR_NOSPC
@@ -1672,7 +1762,7 @@ kifs_jrn_parse:
     test edx, KIFS_JF_VALID
     jz .out
     movzx ecx, word [KIFS_IO_BUF + 16]
-    cmp ecx, KIFS_JRN_PAYLOAD
+    cmp ecx, [kifs_jrn_payload]
     ja .out
     mov esi, KIFS_IO_BUF + 20
     call kifs_crc16
@@ -1813,7 +1903,8 @@ kifs_jrn_build_ctrl:
     mov [kifs_jb_flags], edx
     mov edi, KIFS_JRN_BUF
     xor eax, eax
-    mov ecx, KIFS_BLOCK_SIZE / 4
+    mov ecx, [kifs_block_size]
+    shr ecx, 2
     cld
     rep stosd
     mov dword [KIFS_JRN_BUF + 0], KIFS_JRN_MAGIC
@@ -1840,7 +1931,8 @@ kifs_jrn_build_rec:
     mov [kifs_jb_len], ebx
     mov edi, KIFS_JRN_BUF
     xor eax, eax
-    mov ecx, KIFS_BLOCK_SIZE / 4
+    mov ecx, [kifs_block_size]
+    shr ecx, 2
     cld
     rep stosd
     mov dword [KIFS_JRN_BUF + 0], KIFS_JRN_MAGIC
@@ -1933,11 +2025,11 @@ kifs_replay_seq:
     cmp eax, [kifs_total_blocks]
     jae .next
     mov ecx, [kifs_j_offset]
-    cmp ecx, KIFS_BLOCK_SIZE
+    cmp ecx, [kifs_block_size]
     jae .next
     mov edx, [kifs_j_len]
     add edx, ecx
-    cmp edx, KIFS_BLOCK_SIZE
+    cmp edx, [kifs_block_size]
     ja .next
     mov edi, KIFS_JRN_BUF
     call kifs_read_block_to
@@ -1990,9 +2082,9 @@ kifs_jrn_commit:
     mov eax, [esi + 8]
     test eax, eax
     jz .count_next
-    add eax, KIFS_JRN_PAYLOAD - 1
+    mov ecx, [kifs_jrn_payload]
+    lea eax, [eax + ecx - 1]
     xor edx, edx
-    mov ecx, KIFS_JRN_PAYLOAD
     div ecx
     add [kifs_jc_total], eax
 .count_next:
@@ -2045,9 +2137,9 @@ kifs_jrn_commit:
     mov ecx, [esi + 8]
     sub ecx, eax
     jz .next_delta
-    cmp ecx, KIFS_JRN_PAYLOAD
+    cmp ecx, [kifs_jrn_payload]
     jbe .chunk_ok
-    mov ecx, KIFS_JRN_PAYLOAD
+    mov ecx, [kifs_jrn_payload]
 .chunk_ok:
     mov [kifs_jc_chunk], ecx
     mov eax, [kifs_jc_seq]
@@ -2102,11 +2194,11 @@ kifs_jrn_commit:
     mov [kifs_jc_aoff], eax
     mov eax, [esi + 8]
     mov [kifs_jc_alen], eax
-    cmp eax, KIFS_BLOCK_SIZE
+    cmp eax, [kifs_block_size]
     ja .bad_apply
     mov ebx, [kifs_jc_aoff]
     add ebx, eax
-    cmp ebx, KIFS_BLOCK_SIZE
+    cmp ebx, [kifs_block_size]
     ja .bad_apply
     mov eax, [kifs_jc_atgt]
     call kifs_read_block
@@ -2192,7 +2284,7 @@ kifs_flush:
     cmp byte [kifs_bitmap_dirty], 0
     je .no_bitmap
     mov eax, [kifs_data_start]
-    mov ecx, KIFS_BLOCK_SIZE
+    mov ecx, [kifs_block_size]
     mov esi, KIFS_BITMAP_BUF
     call kifs_delta_add_block
     test eax, eax
@@ -2233,70 +2325,107 @@ kifs_mount_sb:
     mov byte [kifs_bitmap_dirty], 0
     mov dword [kifs_delta_n], 0
     mov dword [kifs_txn_n], 0
+    ; ---- 探测块大小:先 4 KiB,再 16 KiB(用块 1 的第一个扇区验 magic/版本)----
+    mov eax, 4096
+    mov [kifs_ms_try], eax
+.try_bs:
+    mov eax, [kifs_ms_try]
+    cmp eax, 4096
+    jne .bs16
+    mov dword [kifs_block_shift], 3        ; 4096 = 8 扇区
+    mov dword [kifs_rec_shift], 5          ; 每块 32 条 record
+    jmp .bs_set
+.bs16:
+    cmp eax, KIFS_BLOCK_SIZE_MAX
+    ja .out
+    mov dword [kifs_block_shift], 5        ; 16384 = 32 扇区
+    mov dword [kifs_rec_shift], 7          ; 每块 128 条 record
+.bs_set:
+    mov [kifs_block_size], eax
+    mov ecx, eax
+    shr ecx, 9
+    mov [kifs_block_sectors], ecx
+    ; 读块 1 的第一扇区:LBA = KIFS_PART_LBA + block_sectors
+    xor edx, edx
+    mov eax, KIFS_PART_LBA
+    add eax, ecx
+    adc edx, 0
+    mov ecx, 1
+    mov edi, KIFS_IO_BUF
+    call ata_read_sectors48
+    cmp dword [KIFS_IO_BUF + 0], KIFS_MAGIC
+    jne .next_bs
+    cmp dword [KIFS_IO_BUF + 4], KIFS_VERSION
+    jne .next_bs
+    mov eax, [kifs_block_size]
+    cmp [KIFS_IO_BUF + 8], eax
+    jne .next_bs
+    ; ---- 整块读入并校验 ----
     mov eax, 1
     call kifs_read_block
     test eax, eax
     jnz .out
-    cmp dword [KIFS_IO_BUF + 0], KIFS_MAGIC
-    jne .out
-    cmp dword [KIFS_IO_BUF + 4], KIFS_VERSION
-    jne .out
-    cmp dword [KIFS_IO_BUF + 8], KIFS_BLOCK_SIZE
-    jne .out
     mov esi, KIFS_IO_BUF
     mov ecx, 108
     call kifs_crc32
     cmp eax, [KIFS_IO_BUF + 108]
-    jne .out
+    jne .next_bs
     mov eax, [KIFS_IO_BUF + 12]            ; total_blocks
     cmp eax, 8
-    jb .out
-    cmp eax, 32768                         ; 单块位图能描述的上限
-    ja .out
+    jb .next_bs
+    mov ecx, [kifs_block_size]
+    shl ecx, 3                             ; 单块位图最多描述 8*bs 块
+    cmp eax, ecx
+    ja .next_bs
     mov [kifs_total_blocks], eax
     mov ebx, [KIFS_IO_BUF + 40]            ; record_start
     cmp ebx, eax
-    jae .out
+    jae .next_bs
     mov ecx, [KIFS_IO_BUF + 44]            ; record_count
     cmp ecx, 2
-    jb .out
-    cmp ecx, 4096
-    ja .out
-    lea edx, [ecx + 31]
-    shr edx, 5                             ; record_blocks
-    add edx, ebx                           ; data_area
-    cmp edx, eax
-    jae .out
-    mov edx, [KIFS_IO_BUF + 48]            ; root_oid
-    test edx, edx
-    jz .out
-    cmp edx, ecx
-    jae .out
-    mov edx, [KIFS_IO_BUF + 20]            ; data_start(位图块)
-    cmp edx, ebx
-    jae .out
+    jb .next_bs
+    cmp ecx, 1048576
+    ja .next_bs
+    mov edx, ecx
+    mov eax, [kifs_rec_shift]
+    mov ecx, eax
+    mov eax, 1
+    shl eax, cl
+    dec eax
+    add edx, eax                           ; ceil(count / records_per_block)
+    mov ecx, [kifs_rec_shift]
+    shr edx, cl
+    add edx, ebx                           ; record 表结束块
+    cmp edx, [kifs_total_blocks]
+    jae .next_bs
+    mov eax, [KIFS_IO_BUF + 48]            ; root_oid
+    test eax, eax
+    jz .next_bs
+    cmp eax, [KIFS_IO_BUF + 44]
+    jae .next_bs
+    mov eax, [KIFS_IO_BUF + 20]            ; data_start(位图块)
+    test eax, eax
+    jz .next_bs
+    cmp eax, ebx
+    jae .next_bs
     mov eax, [KIFS_IO_BUF + 24]            ; data_next
-    mov ecx, [KIFS_IO_BUF + 44]
-    add ecx, 31
-    shr ecx, 5
-    add ecx, [KIFS_IO_BUF + 40]
-    cmp eax, ecx
-    jb .out
+    cmp eax, edx
+    jb .next_bs
     mov ecx, [KIFS_IO_BUF + 28]            ; meta_next
     cmp eax, ecx
-    ja .out
+    ja .next_bs
     mov ecx, [KIFS_IO_BUF + 32]            ; journal_start
     mov ebx, [KIFS_IO_BUF + 36]            ; journal_blocks
     test ebx, ebx
-    jz .out
+    jz .next_bs
     cmp ecx, [KIFS_IO_BUF + 28]
-    jb .out
+    jb .next_bs
     mov edx, ecx
     add edx, ebx
     mov eax, [KIFS_IO_BUF + 12]
     dec eax                                ; 最后一块是 sb 备份,不能给 journal
     cmp edx, eax
-    ja .out
+    ja .next_bs
     ; ---- 存全局 ----
     mov eax, [KIFS_IO_BUF + 4]
     mov [kifs_version], eax
@@ -2330,10 +2459,14 @@ kifs_mount_sb:
     cld
     rep movsb
     mov byte [kifs_label + 32], 0
-    ; ---- sb 影子 + 旧副本 ----
+    ; journal payload = block_size - 20
+    mov eax, [kifs_block_size]
+    sub eax, 20
+    mov [kifs_jrn_payload], eax
+    ; ---- sb 影子(只拷 512 B)+ 旧副本 112 B ----
     mov esi, KIFS_IO_BUF
     mov edi, KIFS_SB_BUF
-    mov ecx, KIFS_BLOCK_SIZE / 4
+    mov ecx, 512 / 4
     cld
     rep movsd
     mov esi, KIFS_SB_BUF
@@ -2347,10 +2480,17 @@ kifs_mount_sb:
     jnz .out
     mov esi, KIFS_IO_BUF
     mov edi, KIFS_BITMAP_BUF
-    mov ecx, KIFS_BLOCK_SIZE / 4
+    mov ecx, [kifs_block_size]
+    shr ecx, 2
     cld
     rep movsd
     mov dword [kifs_ms_ret], 0
+    jmp .out
+.next_bs:
+    cmp dword [kifs_ms_try], 4096
+    jne .out
+    mov dword [kifs_ms_try], KIFS_BLOCK_SIZE_MAX
+    jmp .try_bs
 .out:
     popad
     mov eax, [kifs_ms_ret]
@@ -3405,6 +3545,11 @@ kifs_cmd_journal:
 kifs_ok            db 0
 kifs_version       dd 0
 kifs_block_size    dd 0
+kifs_block_sectors dd 0
+kifs_block_shift   dd 0
+kifs_rec_shift     dd 0
+kifs_jrn_payload   dd 0
+kifs_ms_try        dd 0
 kifs_total_blocks  dd 0
 kifs_record_start  dd 0
 kifs_record_count  dd 0
@@ -3449,7 +3594,8 @@ kifs_path_len      dd 0
 kifs_ls_size       dd 0
 kifs_ls_pos        dd 0
 
-kifs_cat_left      dd 0
+kifs_cat_left_lo   dd 0
+kifs_cat_left_hi   dd 0
 kifs_cat_ne        dd 0
 kifs_cat_exti      dd 0
 kifs_cat_blk       dd 0
@@ -3632,7 +3778,7 @@ n_kifs_rm    db 'rm', 0
 n_kifs_journal db 'journal', 0
 
 ; 文案。错误文案按任务规格逐字固定,测试断言要匹配。
-msg_kifs_noimg     db 'kifs: no KiFS image (read-write driver at LBA 22528)', 10, 0
+msg_kifs_noimg     db 'kifs: no KiFS image (read-write driver at LBA ', 0
 msg_kifs_usage     db 'kifs: usage: kifs info | ls [path] | cat <path> | stat <path> | mkdir <path> | write <path> [text] | rm <path> | journal', 10, 0
 msg_kifs_notfound  db 'kifs: path not found', 10, 0
 msg_kifs_notdir    db 'kifs: not a directory', 10, 0
@@ -3641,7 +3787,7 @@ msg_kifs_dirbig    db 'kifs: directory too big (max 4 KiB)', 10, 0
 msg_kifs_filebig   db 'kifs: file too big (Phase B0 cat supports <= 60 KiB)', 10, 0
 msg_kifs_ioerr     db 'kifs: read error (ATA)', 10, 0
 
-msg_kifs_info_head db 'kifs: KiFS read-write driver (Phase C1), partition at LBA 22528', 10, 0
+msg_kifs_info_head db 'kifs: KiFS read-write driver (Phase C1), partition at LBA ', 0
 msg_kifs_magic     db '  magic=KIFS version=', 0
 msg_kifs_blocksize db ' block_size=', 0
 msg_kifs_total     db '  total_blocks=', 0
