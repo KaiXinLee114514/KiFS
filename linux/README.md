@@ -173,3 +173,33 @@ loop 块设备再跑一遍块设备路径（真机裸分区不会自动碰）。
 | 写入 `ENOSPC` | 卷满（`df` 看 free blocks）或连续块不够 → `fsck`/删文件 |
 | `fsck` 报错 | 先卸载；别手动改镜像；驱动每次写都有 journal，正常不会坏 |
 | 权限显示成 `dr-xr-xrwx` 之类 | 旧版驱动的位序 bug，已修；升级到最新 `linux/fuse_kifs.py` |
+
+## 8. 一键挂载脚本 `linux/kifs-mount.sh`
+
+日常使用（尤其是 USB 实体盘会重新枚举成 sda/sdb/sdc）推荐用这个脚本，不用每次手动
+拼 `mount` 命令或找我：
+
+```bash
+# 一次性安装到 PATH（当前用户）
+ln -sf /Files/Project/kifs/linux/kifs-mount.sh ~/.local/bin/kifs-mount
+
+kifs-mount            # 挂载（默认，等价 kifs-mount mount）
+kifs-mount umount     # 卸载
+kifs-mount restart    # 先卸再挂（换驱动/换盘后常用）
+kifs-mount status     # 看设备/挂载/驱动/空间
+kifs-mount data       # 用 udisks 挂载 DATA(exFAT) 分区
+```
+
+脚本做的事：
+
+- **按分区名找设备**：优先 `/dev/disk/by-partlabel/kifs`（稳定，与 sda/sdb 无关），
+  其次 `/dev/kifs`（udev 规则创建），最后扫描分区找 `KIFS` 魔数。
+- 处理 USB 刚插入/重新枚举：`KIFS_WAIT=15` 默认等 15 秒。
+- 自动清理陈旧挂载与残留 `fuse_kifs.py` 进程（`fusermount3 -uz` + kill）。
+- 后台起驱动 + 等挂载点就绪；日志落在 `~/.local/state/kifs/`。
+
+可调环境变量：`KIFS_REPO`、`KIFS_MNT`、`KIFS_DEV`、`KIFS_WAIT`、`KIFS_LOG_DIR`、`KIFS_PY`。
+
+> 实体盘权限：udev 规则 `/etc/udev/rules.d/70-kifs.rules` 按 USB-SATA 桥序列号
+> `235678C218CA` 给 `sd?1` 设 `OWNER=kai MODE=0600`，插到任何 USB 口都能直接读写。
+> 需要我改成 systemd user 服务开机/登录自动挂载的话，说一声。
