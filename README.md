@@ -2,8 +2,8 @@
 
 一个以「对象 + 倒排关键词索引」为核心的 4 KiB 块文件系统 —— 目录只是视图，语义查询是一等公民。
 
-> 状态：设计定稿（v0.2，2026-11-15）；Phase A 宿主原型（`tools/mkifs.py`）已完成——含 journal redo + CoW 写入路径 + 断电注入自测（29 项）；内核只读驱动 B0 已有独立分支实现，内核写入未开始。
-> 设计稿见 [docs/kifs.md](docs/kifs.md)。
+> 状态：**v0.3**（2026-11-15）——宿主原型 A（journal+CoW+断电注入）与内核驱动 C1（读写 + journal + CoW，48 项交叉验证）均已完成。
+> 设计稿：[docs/kifs.md](docs/kifs.md) · 内核驱动：[kernel/README.md](kernel/README.md) · 集成指南：[docs/integration.md](docs/integration.md)
 
 ## 设计速览
 
@@ -15,13 +15,32 @@
 - 断电一致性：BEGIN → BLOCK → COMMIT → 落盘 → END 的环形 journal
 - 查询示例：`"Last Summer family photos"` → 时间区间 + 类型 + keyword 的结构化过滤
 
+## 项目结构
+
+```
+kifs/
+├── docs/
+│   ├── kifs.md           设计稿（磁盘布局/Record/目录/journal/权限/关键词/路线）
+│   └── integration.md    如何把 kernel/kifs.asm 集成进一个 32 位内核
+├── kernel/
+│   ├── kifs.asm          KiFS 内核驱动（x86 nasm 平铺，Phase C1 读写+journal+CoW）
+│   └── README.md         驱动说明（命令/内存布局/写入语义/测试）
+├── tools/
+│   ├── mkifs.py          宿主原型：format/mkdir/write/read/ls/stat/rm/info/fsck/journal
+│   ├── test_mkifs.py     宿主自测 15 项
+│   └── test_journal.py   断电注入自测 29 项（after_begin/records/commit/apply/torn）
+└── README.md
+```
+
+参考实现分两层：宿主 Python（`tools/mkifs.py`，字节级权威）与内核汇编（`kernel/kifs.asm`，与之逐字节一致）。
+
 ## 路线图
 
 | Phase | 内容 | 状态 |
 |---|---|---|
 | A | `tools/mkifs.py` 宿主原型（format/mkdir/write/read/ls/stat/rm/info/fsck/journal）+ 测试镜像 | ✅ 完成（连续 extent / 目录线性 / **journal redo + CoW**）|
-| B | 内核只读驱动（挂载 /MNT/KIFS） | B0 分支完成（只读驱动 + kifs 命令组，未合入）|
-| C | 内核写入 + journal + 断电注入测试 | 宿主侧已完成（journal+CoW+断电注入），内核侧未开始 |
+| B | 内核只读驱动（挂载 /MNT/KIFS） | ✅ B0：只读驱动 + `kifs info/ls/cat/stat`（KKernel `kifs-phase-b` 分支）|
+| C | 内核写入 + journal + 断电注入测试 | ✅ C1：内核写入 + journal + CoW（`kifs-phase-c` 分支，48 项断言）；C2 真机 kill -9 压测待做 |
 | D | keywords 倒排 + 语义查询 | 未开始 |
 | E | 快照/CoW、Subindex、压缩 | 未开始 |
 
@@ -36,11 +55,25 @@ python3 tools/mkifs.py ls     /tmp/kifs.img /docs
 python3 tools/mkifs.py fsck   /tmp/kifs.img
 ```
 
-自测（临时目录里跑完整流程，含损坏检测）：
+自测：
 
 ```bash
-python3 tools/test_mkifs.py
+python3 tools/test_mkifs.py     # 15 项宿主流程自测
+python3 tools/test_journal.py   # 29 项断电注入自测（journal+CoW）
 ```
+
+内核侧（KKernel 参考仓库的 `kifs-phase-c` 分支）：
+
+```bash
+make test-kifs        # 48 项：内核读写/journal/reboot 持久化/崩溃重放/宿主交叉验证
+```
+
+## 内核驱动快速上手
+
+- 复制 `kernel/kifs.asm` 进内核，`%include` 在 ATA 驱动之后，启动时 `call kifs_init`（没有卷就静默跳过）。
+- 命令：`kifs info / ls / cat / stat / mkdir / write / rm / journal`。
+- 固定分区 LBA 22528（11 MiB），不挂 VFS；写入走 journal（KJRN+CRC16）与 CoW。
+- 详细接入与依赖见 [docs/integration.md](docs/integration.md) 和 [kernel/README.md](kernel/README.md)。
 
 ## 为什么不开源（暂时）
 
