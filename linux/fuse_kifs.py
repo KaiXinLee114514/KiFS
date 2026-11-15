@@ -365,9 +365,11 @@ class KifsFS(Operations):
     def create(self, path, mode, fi=None):
         parent, _name = self.img.parent_record(path)
         self._check_dir_write(parent)
-        self.img.create_file(path, perm=mode_to_perm(mode & 0o777))
+        rec = self.img.create_file(path, perm=mode_to_perm(mode & 0o777))
         self._flush()
-        return 0
+        # fusepy 默认 raw_fi=False：create 的返回值就是内核用的 fh。
+        # 返回 0 会让内核后续 write 都以 fh=0 走慢路径（逐 4KiB 提交）。
+        return rec.oid
 
     @_locked
     def mknod(self, path, mode, dev):
