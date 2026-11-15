@@ -73,7 +73,6 @@ KIFS_INLINE_OFF   equ 36                 ; v2 内联数据固定偏移
 KIFS_INLINE_MAX   equ 92
 KIFS_REC_SIZE     equ 128
 KIFS_DIR_MAX      equ 4096               ; 目录内容最大 4 KiB(单块)
-KIFS_CAT_MAX      equ 61440              ; 仅保留旧错误文案,cat 已流式不再限制
 
 ; 写入驱动
 KIFS_DATA_MAX       equ 32768              ; 单次 write 数据上限(32 KiB)
@@ -964,7 +963,7 @@ cmd_kifs:
 
 ; ---------------------------------------------------------------------------
 ;  kifs cat <path> — 流式输出,内联直接打,extent 按块读、按字节打
-;  (不往内存里整份放,所以 60 KiB 上限只是个"别拿它 cat 大文件"的规矩)
+;  (不往内存里整份放,u64 大小按块流式读)
 ; ---------------------------------------------------------------------------
 .do_cat:
     cmp dword [kifs_path_len], 0
@@ -1218,14 +1217,6 @@ cmd_kifs:
 .err_dirbig:
     mov dword [kifs_err], KIFS_ERR_DIRBIG
     jmp .err
-.err_filebig:
-    mov al, COL_ERR
-    call term_set_color
-    mov esi, msg_kifs_filebig
-    call term_print
-    mov al, COL_NORMAL
-    call term_set_color
-    jmp .done
 .usage:
     call kifs_print_usage
 .done:
@@ -1233,7 +1224,7 @@ cmd_kifs:
     ret
 
 ; ===========================================================================
-;  Phase C1 — journal + CoW 写入
+;  journal + CoW 写入(v2)
 ;  ---------------------------------------------------------------------------
 ;  事务边界 = 一条 kifs 命令(和宿主 tools/mkifs.py 的 Image.flush 一致):
 ;    1. 数据块 CoW:先分配新块、直接 ATA 写(提交前是孤儿),再释放旧块;
@@ -3074,7 +3065,7 @@ kifs_dir_remove:
     ret
 
 ; ===========================================================================
-;  Phase C1 shell 命令:mkdir / write / rm / journal
+;  shell 命令:mkdir / write / rm / journal
 ;  每个命令 = 一个事务:改影子(delta/位图)→ flush 提交。任何一步失败都
 ;  kifs_txn_abort 丢弃未提交改动(重读 sb + 位图)。
 ; ===========================================================================
@@ -3606,7 +3597,7 @@ kifs_cat_last      db 0
 
 kifs_st_i          dd 0
 
-; ---- Phase C1 状态 ----
+; ---- 写入状态 ----
 kifs_data_start      dd 0
 kifs_data_next       dd 0
 kifs_meta_next       dd 0
@@ -3784,10 +3775,9 @@ msg_kifs_notfound  db 'kifs: path not found', 10, 0
 msg_kifs_notdir    db 'kifs: not a directory', 10, 0
 msg_kifs_notfile   db 'kifs: not a file', 10, 0
 msg_kifs_dirbig    db 'kifs: directory too big (max 4 KiB)', 10, 0
-msg_kifs_filebig   db 'kifs: file too big (Phase B0 cat supports <= 60 KiB)', 10, 0
 msg_kifs_ioerr     db 'kifs: read error (ATA)', 10, 0
 
-msg_kifs_info_head db 'kifs: KiFS read-write driver (Phase C1), partition at LBA ', 0
+msg_kifs_info_head db 'kifs: KiFS v2 read-write driver (journal+CoW), partition at LBA ', 0
 msg_kifs_magic     db '  magic=KIFS version=', 0
 msg_kifs_blocksize db ' block_size=', 0
 msg_kifs_total     db '  total_blocks=', 0
