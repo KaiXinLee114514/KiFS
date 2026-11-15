@@ -724,7 +724,10 @@ class Image(object):
             nb = (b | mask) if val else (b & ~mask & 0xFF)
             if nb != b:
                 self._write_bytes(off, bytes([nb]))
-                self.mark(self.sb.data_start, byte_idx, 1)
+                # 用 mark_span：off 是整卷字节偏移，拆成 (block, in-block offset)；
+                # 之前直接 mark(data_start, byte_idx) 在 >8 GiB 卷上 offset 会超过
+                # journal 头的 u16 范围（530738//8>65535）→ struct.error / 短写。
+                self.mark_span(off, 1)
             lo += take
             n -= take
 
@@ -737,7 +740,7 @@ class Image(object):
             nb = b & ~(1 << (blk % 8)) & 0xFF
         if nb != b:
             self._write_bytes(off, bytes([nb]))
-            self.mark(self.sb.data_start, blk // 8, 1)
+            self.mark_span(off, 1)   # off 是整卷字节偏移（同上：大卷 u16 溢出修复）
 
     def bits_value(self, lo, n):
         """读位图 [lo, lo+n) 的 n 个 bit，返回整数（bit i 对应块 lo+i）。"""

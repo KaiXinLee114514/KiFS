@@ -168,12 +168,42 @@ def inprocess_recover(work):
     ok(run(["fsck", base]).returncode == 0, "[4K] 同进程恢复+续写后 fsck")
 
 
+def test_large_bitmap_mark(work):
+    """回归：块号 > 524280 时位图字节索引 > 65535，旧代码直接把 byte_idx 当
+    journal 头的 u16 offset → struct.error（真实 1TB 盘写 ~8.7GB 后触发短写）。"""
+    print("== 大卷位图 mark 偏移回归（journal offset u16 溢出） ==")
+    img = os.path.join(work, "bigvol.img")
+    with open(img, "wb") as f:
+        f.truncate(9 << 30)                       # 9 GiB 稀疏
+    ok(run(["format", img, "--size-mib", str(9 * 1024),
+            "--block-size", "16384"]).returncode == 0, "大卷 format")
+
+    sys.path.insert(0, HERE)
+    import struct as _struct
+    import mkifs
+    image = mkifs.Image(img)
+    try:
+        # 把分配游标推到块 530000（模拟大卷后期）；其位图字节 66250 > 65535
+        image.sb.data_next = 530000
+        image.write_file("/high.bin", b"x" * 500)  # 超 INLINE_MAX → 分配 extent
+        image.flush()
+        ok(True, "块号 530000 分配出的位图 mark 可正常提交 journal")
+    except _struct.error as e:
+        ok(False, "位图 mark journal 提交溢出: %s" % e)
+    finally:
+        image.close()
+    ok(run(["fsck", img]).returncode == 0, "大卷 fsck 通过")
+    r = run(["stat", img, "/high.bin"])
+    ok(r.returncode == 0 and b"530000" in r.stdout, "大卷文件 extent 落在块 530000")
+
+
 def main():
     work = tempfile.mkdtemp(prefix="kifs-v2-journal-")
     try:
         for bs, mib in ((4096, 4), (16384, 64)):
             suite(work, bs, mib)
         inprocess_recover(work)
+        test_large_bitmap_mark(work)
         print("\n%d 通过, %d 失败" % (PASS, FAIL))
         if FAIL:
             sys.exit(1)
