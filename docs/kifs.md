@@ -57,9 +57,13 @@
 最后一块          Superblock 备份 2
 ```
 
-- 两个游标：`data_next` 从盘头往上长，`meta_next` 从盘尾往下长；`data_next >= meta_next` 即满盘。
+- 两个游标：`data_next` 从盘头往上长，`meta_next` 从盘尾往下长；`data_next > meta_next` 即满盘。
 - 全部**小端**。
-- 块大小固定 4096 B；盘按块编号寻址（`lba = part_lba + block * 8`）。
+- 块大小 `block_size` ∈ {4096, 16384}（v2）：`block_sectors = block_size / 512`（4K=8，16K=32）；
+  盘按块编号寻址 `lba = part_lba + block * block_sectors`（v2 内核需 LBA48）。
+- `bitmap_blocks = ceil(total_blocks / (8*block_size))`，Record 表紧随位图，
+  占 `ceil(record_count*128/block_size)` 块；`data_start` 指位图起始块（=3）。
+- 块号是 u32：4 KiB 块时单卷最大 16 TiB，16 KiB 块时 64 TiB - 16 KiB（`total_blocks` 装不下 2^32）。
 
 ---
 
@@ -68,11 +72,11 @@
 | 偏移 | 大小 | 字段 | 说明 |
 |---:|---:|---|---|
 | 0 | 4 | `magic` | `'KIFS'` = `0x5346494B`（小端读） |
-| 4 | 4 | `version` | `0x0001_0000`（v1.0） |
-| 8 | 4 | `block_size` | 4096 |
-| 12 | 4 | `total_blocks` | 分区总块数 |
+| 4 | 4 | `version` | `0x0002_0000`（v2.0；v1 镜像不再支持） |
+| 8 | 4 | `block_size` | 4096 / 16384 |
+| 12 | 4 | `total_blocks` | 分区总块数（u32，最大 `2^32-1`） |
 | 16 | 4 | `part_lba` | 本分区起始 LBA（供宿主工具用） |
-| 20 | 4 | `data_start` | 数据/位图区起始块号 |
+| 20 | 4 | `data_start` | 位图起始块号（v2 固定为 3） |
 | 24 | 4 | `data_next` | 下一个空闲数据块（向上游标） |
 | 28 | 4 | `meta_next` | 下一个空闲元数据块（向下游标） |
 | 32 | 4 | `journal_start` | Journal 起始块号 |
@@ -89,41 +93,49 @@
 
 - 块 1 主副本，块 2 备份；盘尾倒数第 1 块再存一份（防头部损坏）。
 - 校验和覆盖 `[0, 108)`；superblock 每次只整体写（<单扇区），天然原子。
+- superblock 位置随块大小移动：4 KiB 块在字节 4096，16 KiB 块在字节 16384；探测时
+  两者都试，版本、块大小、CRC 都对上才算数。
 
 ---
 
 ## 5. Record（元数据记录，128 B × `record_count`）
 
-Record 表放在块 1 之后固定区域：`record_start` 起，槽号即 OID。
+Record 表放在位图之后：`record_start` 起，槽号即 OID。v2 用 `size_lo/size_hi` +
+`blocks_lo/blocks_hi` 拼 u64，extent 改为 `(start u64, count u32)`。
 
 | 偏移 | 大小 | 字段 | 说明 |
 |---:|---:|---|---|
 | 0 | 4 | `oid` | 自身 OID（冗余校验，应等于槽号） |
 | 4 | 1 | `type` | 1=file，2=dir，3=symlink（预留） |
-| 5 | 1 | `flags` | 0x01=system，其余预留（hide/ro/iolock 统一放 `perm` 里） |
-| 6 | 2 | `perm` | 16 位权限/属性字：bit0-8 = `rwxrwxrwx`，bit9 = hide，bit10 = ro，bit11 = iolock，bit12-15 预留 |
-| 8 | 4 | `size` | 文件字节数 |
-| 12 | 4 | `blocks` | 实际占用数据块数 |
+| 5 | 1 | `flags` | 0x01=system，其余预留 |
+| 6 | 2 | `perm` | 16 位权限/属性字：bit0-8 = `rwxrwxrwx`，bit9 = hide，bit10 = ro，bit11 = iolock |
+| 8 | 4 | `size_lo` | 文件字节数低 32 位 |
+| 12 | 4 | `blocks_lo` | 占用块数低 32 位 |
 | 16 | 4 | `parent` | 父目录 OID（根为 0） |
-| 20 | 4 | `ctime` | 创建时间（Unix 秒，v1 用 RTC 近似） |
+| 20 | 4 | `ctime` | 创建时间（Unix 秒） |
 | 24 | 4 | `mtime` | 修改时间 |
 | 28 | 4 | `kw_index` | 关键词倒排引用（0=无） |
-| 32 | 1 | `n_ext` | 内联 extent 个数（0..4） |
+| 32 | 1 | `n_ext` | 内联 extent 个数（0..3） |
 | 33 | 1 | `inline_len` | 内联文件长度 0..92 |
 | 34 | 2 | `inline_off` | 内联数据在记录内的偏移（默认 36） |
-| 36 | 36 | `extents[3]` | 每个 extent：`start u32 + count u16`，最多 3 个内联 |
-| 72 | 4 | `ext_index` | 超出内联的 extent 表所在块号（0=无） |
+| 36 | 36 | `extents[3]` | **每项 12 B：`start u64 + count u32`**，最多 3 个内联 |
+| 72 | 4 | `ext_index` | 超出内联的 extent 表所在块号（0=无；表项同样 12 B/项） |
 | 76 | 4 | `n_ext_total` | extent 总数 |
 | 80 | 4 | `next_free_oid` | 预留（链式扩展用） |
-| 84 | 16 | `owner` | 所有者用户名（UTF-8，NUL 填充，最多 15 字符；v1 单用户也记录） |
-| 100 | 28 | `reserved` | 填 0 |
+| 84 | 16 | `owner` | 所有者用户名（UTF-8，NUL 填充，最多 15 字符） |
+| 100 | 4 | `size_hi` | 文件字节数高 32 位 |
+| 104 | 4 | `blocks_hi` | 占用块数高 32 位 |
+| 108 | 20 | `reserved` | 填 0 |
 
-- 内联上限 92 B（v1），≤92 B 的文件直接躺在 record 里。
-- 文件 > 92 B：用 extent 段；≤3 段全部内联，更多则 `ext_index` 指向数据区里的一张
-  `u32 u16` 数组块。
-- Record 表在 format 时固定 `record_count`（默认盘大小的 1/64，上限 4096）。
-
----
+- `size = size_lo | (size_hi << 32)`；`blocks = blocks_lo | (blocks_hi << 32)`。单文件最大 16 EiB（格式上限），实际受卷大小限制。
+- extent：`start` 为分区内块号 u64（LBA48 足够），`count` u32；单 extent 最大
+  `2^32-1` 块 → 16 KiB 块时 64 TiB。
+- 内联上限 92 B（`inline_off=36`，数据覆盖 36..128）。**注意**：内联时
+  `extents`/`ext_index`/`n_ext_total`/`owner`/`size_hi`/`blocks_hi` 这些槽位都是文件内容，
+  不能解析；内联文件的 size 一律等于 `inline_len`，blocks=0，owner 无记录。
+- Record 表在 format 时固定：`record_count = min(max(16, total_blocks // 64), 1<<20)`，
+  `--record-cap N` 可覆盖（N ≤ 1M）。1M 槽 = 128 MiB 表，对应 64 GiB 以上卷不再增长。
+- 数据块区里 `ext_index` 表（>3 段时）按 12 B/项存放，也走位图/CoW。
 
 ## 6. 目录格式
 
@@ -138,7 +150,7 @@ Record 表放在块 1 之后固定区域：`record_start` 起，槽号即 OID。
 | 8 | … | `name`（UTF-8，不 NUL 结尾，`name_len` 字节） |
 | … | 0-3 | 补齐到 4 字节 |
 
-- 查找：顺序扫描（v1）；目录大于 64 KiB 后启用 Subindex 分级（预留）。
+- 查找：顺序扫描；目录大于 64 KiB 后启用 Subindex 分级（预留）。
 - `entry_len - 8 - name_len` 的尾部字节为 0。
 - 目录项 `type` 与 record 的 `type` 应一致，不一致视为损坏（fsck 报）。
 - 根目录（OID=1）的 `parent=0`，名字为空。
@@ -147,18 +159,19 @@ Record 表放在块 1 之后固定区域：`record_start` 起，槽号即 OID。
 
 ## 7. 块分配（位图 + extent）
 
-- **块位图**：1 bit / 块，从 `data_start` 块起的固定区域；bit=1 已用。
-- 分配：**next-fit**，从 `data_next` 向后找连续空闲段；到盘尾回绕一次。
+- **块位图**：1 bit / 块，从 `data_start` 块起，占 `ceil(total_blocks/(8*block_size))` 块；bit=1 已用。
+- 分配：**next-fit**，从 `data_next` 向后找连续空闲段；释放后 `data_next` 回退到最小释放块。
 - 释放：清位图位 + `free_blocks` 计数。
 - extent 合并：相邻 extent 自动合并；不移动数据。
 - 小文件内联（≤92 B）不占块。
-- 数据区与元数据区之间的空闲块由两个游标共同维护。
+- 数据区与元数据区之间的空闲块由两个游标共同维护；fsck 校验位图标记总数 = 所有 extent 声明块数。
+- 宿主实现一次写只用一个连续 extent（数据区够大即可）；读取/fsck 兼容 `ext_index` 多段。
 
 ---
 
 ## 8. Journal（redo，盘尾固定预留）
 
-- 预留 `journal_blocks`（默认 64 块 = 256 KiB），环形；块号 `journal_start + i`。
+- 预留 `journal_blocks`（默认 64 块；4 KiB 块 = 256 KiB，16 KiB 块 = 1 MiB），环形；块号 `journal_start + i`。
 - **一个 journal 块承载一条记录**（简化：逐块 CRC、易做断电注入）：
 
 | 偏移 | 大小 | 字段 | 说明 |
@@ -168,11 +181,13 @@ Record 表放在块 1 之后固定区域：`record_start` 起，槽号即 OID。
 | 8 | 2 | `flags` | bit0 VALID，bit1 BEGIN，bit2 COMMIT，bit3 END |
 | 10 | 2 | `offset` | 数据片在目标块内偏移（BEGIN/COMMIT/END 为 0） |
 | 12 | 4 | `target_block` | 目标块号（BEGIN/COMMIT/END 为 0） |
-| 16 | 2 | `len` | payload 长度（≤ 4076） |
+| 16 | 2 | `len` | payload 长度（≤ block_size-20：4K→4076，16K→16364） |
 | 18 | 2 | `crc16` | CRC-16/CCITT（poly 0x1021，init 0xFFFF）覆盖 payload |
-| 20 | 4076 | `payload` | 数据片 |
+| 20 | block_size-20 | `payload` | 数据片 |
 
-- 大块拆分：一个目标块/连续区间的数据按 4076 B 切片，逐片记录（同 seq、同 target、offset 递增）；恢复时按 (target, offset) 排序应用。
+- 大块拆分：一个目标块/连续区间的数据按 `block_size-20` 切片，逐片记录（同 seq、同 target、offset 递增）；恢复时按 (target, offset) 排序应用。
+- 宿主实现会把同事务里相邻的 after-image 增量合并成一条记录（位图连续字节尤其重要，
+  否则一次大分配就能写满 64 块 journal）；合并后仍满足上述格式。
 - 事务协议：
   1. `BEGIN(seq)` 写一个 journal 块
   2. 逐条写数据片记录（看情况 1~N 块）
@@ -265,11 +280,21 @@ rwxrwxrwx111kai
 
 - **Phase A（宿主原型，不碰内核）**：`tools/mkifs.py`
   - format / mkdir / write / read / ls / 小文件内联 / extent 分配 / fsck
-  - **A2（已完成，2026-11-15）**：journal redo + CoW 写入路径 + 断电注入自测（`tools/test_journal.py` 29 项：BEGIN/records/COMMIT/apply/torn 五个注入点 → 重开恢复后内容与 fsck 均一致）；未提交事务在挂载时自动回收槽位（写 END）
-  - Python 单文件，输出 4 MiB 测试镜像；与设计表逐字节对齐
+  - **A2（已完成，2026-11-15）**：journal redo + CoW 写入路径 + 断电注入自测
+  - **A3 = v2（已完成，2026-11-15）**：16 KiB 块、u64 文件大小、extent `(u64,u32)`、
+    record 上限 1M、大卷稀疏 format（15 TiB 只写 ~249 MiB 元数据）。
+    自测：`tools/test_mkifs.py` 192 项（4K+16K）、`tools/test_journal.py` 91 项
+    （4K+16K × 5 种断电注入）。
+  - Python 单文件；CI 用 4 KiB 块小镜像，大卷用 16 KiB 块；与设计表逐字节对齐
 - **Phase B（内核只读）**：`kernel/kifs.asm`
-  - **B0（已完成，2026-11-14）**：KKernel 里的只读驱动 + `kifs` 命令组 —— `kifs info` / `ls [路径]` / `cat <路径>` / `stat <路径>`；superblock 校验（魔数 / 版本 / CRC32）、目录项逐段遍历、内联 + extent 读取。**固定 LBA 22528**、只读、不挂 VFS；宿主 `mkifs.py` 造的镜像 dd 到 16 MB 盘 FAT16 分区之后自测（`make test-kifs`，12 项屏幕断言）
-  - B1（待做）：mount（校验 superblock + journal 重放判定）、按关键词过滤的只读查询、挂载点 `/MNT/KIFS`
+  - **B0（已完成，2026-11-14，v1 格式）**：KKernel 里的只读驱动 + `kifs` 命令组 ——
+    `kifs info` / `ls [路径]` / `cat <路径>` / `stat <路径>`；superblock 校验
+    （魔数 / 版本 / CRC32）、目录项逐段遍历、内联 + extent 读取。**固定 LBA 22528**、
+    只读；宿主镜像 dd 到 16 MB 盘 FAT16 分区之后自测（`make test-kifs`）
+  - **B1（v2，待做）**：按 v2 规格升级内核驱动：从 superblock 读 `block_size`、
+    16 KiB 块缓冲、LBA48、u64 size/extent。⚠️ v1 驱动读到 v2 镜像会因版本不符拒绝，
+    升级前 `make test-kifs` 需继续用 v1 镜像或同步升级
+  - B2：mount（校验 superblock + journal 重放判定）、按关键词过滤的只读查询、挂载点 `/MNT/KIFS`
 - **Phase C（内核写入）**：写文件 + extent 分配 + journal + 断电注入测试
 - **Phase D（关键词）**：tag 命令 + 倒排表构建/查询；语义查询解析器可放外部工具
 - **Phase E（后续）**：快照/CoW、Subindex 树、压缩、加密
@@ -281,51 +306,84 @@ rwxrwxrwx111kai
 | 项 | 值 |
 |---|---|
 | magic | `b'KIFS'` |
-| 版本 | `0x0001_0000` |
-| 块大小 | 4096 |
+| 版本 | `0x0002_0000`（v2；v1 不再支持） |
+| 块大小 | 4096 / 16384（默认 4096，大卷 16384） |
 | record 大小 | 128 |
+| record 上限 | `min(max(16, total_blocks//64), 1<<20)`，`--record-cap` 可覆盖（≤1M） |
 | perm 字 | 16 位：rwxrwxrwx + hide + ro + iolock |
 | owner | 16 B 用户名（UTF-8，NUL 填充） |
-| 内联上限 | 92 B |
-| 内联 extent 上限 | 3 个 |
+| 内联上限 | 92 B（数据占 record 36..128） |
+| 内联 extent | 3 个，每项 12 B：`start u64 + count u32` |
+| 文件大小 | u64：`size_lo@8` + `size_hi@100`；blocks 同理 `@12/@104` |
 | 目录项头 | 8 B，名字 UTF-8，4 对齐 |
-| journal 头 | `b'KJRN'` + seq + flags + count |
-| 默认 journal | 64 块（256 KiB） |
-| 默认 record 槽 | 盘块数/64，上限 4096 |
+| journal 头 | 20 B：`'KJRN'` + seq u32 + flags u16 + offset u16 + target u32 + len u16 + crc16 |
+| 默认 journal | 64 块（4K=256 KiB，16K=1 MiB） |
+| 单卷上限 | 4K 块 16 TiB；16K 块 64 TiB - 16 KiB（u32 total_blocks） |
 
 ---
 
 ## 14. 未决问题（实现前再定）
 
-1. Record 表固定槽 vs 动态分配（固定简单但浪费；v1 先固定）
+1. Record 表固定槽 vs 动态分配（固定简单但浪费；v2 固定，上限 1M）
 2. 目录项排序用字节序还是大小写不敏感序
-3. extent 索引块（超过 3 段）是否也走 journal
-4. journal checkpoint / head-tail 回收策略（v1：满则强制落盘+重置）
+3. extent 索引块（超过 3 段）是否也走 journal（当前：ext_index 表按 12 B/项，走位图/CoW）
+4. journal checkpoint / head-tail 回收策略（当前：满则报错退出；宿主已把相邻增量合并以省记录）
 5. keywords 删除/更新的空间回收
 6. KiFS 与 FAT16 的挂载原语（`mount` 命令 + VFS 层抽象）
 7. 断电测试怎么做：QEMU `-snapshot` + 杀进程 + 重新挂载 fsck
-8. owner 直存用户名（v1）vs 以后改 uid 表（需要用户系统）
-9. group/other 的 rwx 在单用户 v1 是否只展示不强制（倾向只展示）
+8. owner 直存用户名 vs 以后改 uid 表（需要用户系统）
+9. group/other 的 rwx 在单用户环境是否只展示不强制（倾向只展示）
+10. 内联数据覆盖 record 尾部字段（owner/size_hi 等），是否值得把内联数据挪到独立区域
 
 ---
 
-## 15. 内核驱动 B0 注意事项
+## 15. 内核驱动注意事项（v2）
 
-- **分区位置固定**：`KIFS_PART_LBA = 22528`。16 MB 硬盘镜像里 FAT16 分区从 LBA 6144 起 8 MB，正好在 22528 结束，KiFS 镜像（4 MiB = 1024 块）就 dd 到 22528 之后；测试命令 `make test-kifs`。
-- **superblock 在分区块 1，不在块 0**：块 0 是引导块留空，主副本在块 1、备份在块 2 与最后一块。内核读块 1，校验魔数 / 版本 / 前 108 字节的 CRC32（`zlib.crc32` 对齐）。⚠️ 设计草稿早期写的「块 0 偏移 0 / label@92」与 `mkifs.py` 实际不符（实际 `label@76`），以 `mkifs.py` 为准。
-- **只读**：不写盘、不重放 journal（v1 的 `flags` clean 位不做恢复动作）。
-- **不校验 owner 权限 / 不做 hide 过滤**：单用户 v1，`ls` 把 `hide` 项也列出来；`perm` 只展示 `rwxrwxrwx` + hide/ro/iolock 三位 + owner。
-- **MVP 限制**：目录内容 ≤ 4 KiB（每层目录单块缓冲）；`cat` 单文件 ≤ 60 KiB（按块流式读，不整文件进内存）。
-- **内联 record 的 36..128 字节被内联数据覆盖**（v0 宿主实现行为）：所以 `inline_len > 0` 时不要解析 extent 区 / owner 字段。
-- **静默失败**：盘上没 KiFS 卷（魔数 / CRC 不对、读盘失败）时 `kifs_init` 直接返回，不影响原有 FAT / 软盘启动路径。
+- **分区位置**：沿用 B0 的 `KIFS_PART_LBA = 22528`；但 v2 镜像不再限制 4 MiB，
+  大卷测试需 LBA48 和更大的盘镜像。宿主生成命令示例：
+  - CI 小镜像：`python3 tools/mkifs.py format disk.img --size-mib 4`
+  - 16K 测试卷：`python3 tools/mkifs.py format disk.img --size-mib 64 --block-size 16384`
+  - 大卷：`python3 tools/mkifs.py format disk.img --size-mib 15728640 --block-size 16384`
+    （15 TiB 稀疏，只占 ~250 MiB 实盘）
+- **superblock 在分区块 1**：块 0 是引导块留空，主副本在块 1、备份在块 2 与最后一块。
+  位置随块大小移动（4K → 字节 4096，16K → 字节 16384）；校验魔数 /
+  `version == 0x00020000` / `block_size ∈ {4096,16384}` / 前 108 字节 CRC32。
+- **读块**：`lba = part_lba + block * (block_size/512)` 用 64 位算，走 LBA48。
+- **Record 解析**：`size = size_lo | (size_hi<<32)`，blocks 同理；extent 每项 12 B
+  `(start u64, count u32)`；`n_ext` 为内联段数，超过 3 段读 `ext_index` 表（12 B/项）。
+- **内联 record 的 36..128 字节被内联数据覆盖**：`inline_len > 0` 时不要解析
+  extent 区 / owner / size_hi / blocks_hi，size 一律取 `inline_len`，blocks=0。
+- **journal**：payload = `block_size-20`（4K→4076，16K→16364）；只读驱动可只看
+  `flags` clean 位，不做重放。
+- **不校验 owner 权限 / 不做 hide 过滤**（单用户）；`perm` 展示 `rwxrwxrwx` + 三位 + owner。
+- **静默失败**：盘上没 KiFS 卷（魔数 / 版本 / CRC 不对、读盘失败）时初始化直接返回，
+  不影响原有 FAT / 软盘启动路径。
 
 ---
 
-## 16. 实现记录：Phase A2（journal redo + CoW，2026-11-15）
+## 16. 实现记录：v2 宿主工具（2026-11-15）
+
+- **代码**：`tools/mkifs.py` 全部按 v2 重写；`tools/test_mkifs.py`、`tools/test_journal.py` 同步。
+- **布局**：块大小参数化；`bitmap@3`、record 表紧随、`data_next` 向上、`meta_next` 向下、
+  盘尾 64 块 journal、末块 super 备份 2；format 只写元数据区（大卷 = 位图+record 表+journal 头）。
+- **Record v2**：`size_lo/size_hi` + `blocks_lo/blocks_hi` 拼 u64；extent `(u64,u32)` 12 B；
+  `record_count = min(max(16, total_blocks//64), 1<<20)`，`--record-cap` 覆盖。
+- **写路径**：元数据增量先合并（同位置取最后值、相邻区间拼接）再进 journal；
+  数据块 CoW；恢复时残缺事务清槽、完整事务重放并写 END，重读 superblock。
+- **fsck 新增检查**：version==2、block_size∈{4096,16384}、位图/record/journal 区不重叠、
+  位图标记数与所有 extent 声明块数一致、size/blocks 与 extent 总块数一致、
+  目录项类型一致、孤立 record、superblock 三副本一致。
+- **实测**：64 GiB/16K format 写 9.5 MiB、15 TiB/16K format 写 249 MiB（0.22s）、
+  15 TiB fsck 0.54s；192 + 91 项自测通过。
+- **历史**：A2（v1 journal/CoW）记录已由 v2 取代；`KIFS_CRASH` 五种注入点语义不变。
+
+---
+
+## 17. 实现记录：Phase A2（journal redo + CoW，v1 历史，2026-11-15）
 
 - **代码**：`tools/mkifs.py`（`Image.recover` / `Image.flush` / `Image._jrn_commit` / `mark` / `mark_span` / `write_data_block`），`tools/test_journal.py`。
 - **写路径**：所有元数据变更（Record 128 B、位图字节、Superblock ×3）先进 `_txn_deltas`；`flush()` 摊平成 journal 记录并提交；数据块（文件/目录内容）永远写新块（CoW），旧块在事务内释放——提交前新块是孤儿，fsck 会认为未用。
 - **恢复**：挂载即 `recover()`；重放 BEGIN+COMMIT 完整且 CRC 全有效的事务（幂等，再写 END 覆盖 BEGIN 槽）；残缺事务（崩在 BEGIN/记录阶段）直接写 END 回收槽位，不重放。
 - **注入点**：`KIFS_CRASH=after_begin|after_records|after_commit|after_apply|torn`（torn 会在 COMMIT 前写坏最后一条记录的 payload CRC）。
-- **验证结论**：after_begin/after_records/torn → 内容保持旧值（事务丢弃）；after_commit/after_apply → 内容为新值（重放幂等）；所有场景重开 fsck 通过、无悬挂事务；CoW 重写实测新旧 extent 起点不同（旧 5 → 新 9），旧块被正确释放。
-- **已知简化**：journal 单槽单记录（64 块 = 64 条记录，一次写 12.8 KiB 数据约用 2 条元数据记录，容量足够 v1）；无 journal 满时的优雅降级（超限直接 SystemExit）；无 fsync/barrier 语义（宿主原型层直接 flush 文件）。
+- **验证结论**：after_begin/after_records/torn → 内容保持旧值（事务丢弃）；after_commit/after_apply → 内容为新值（重放幂等）；所有场景重开 fsck 通过、无悬挂事务；CoW 重写实测新旧 extent 起点不同，旧块被正确释放。
+- **注意**：本节是 v1 时代记录，v2 的 journal 格式与注入点语义不变，但 payload 长度与块大小相关。

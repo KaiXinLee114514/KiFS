@@ -1,7 +1,12 @@
 # KiFS 内核驱动（kifs.asm）
 
 `kernel/kifs.asm` 是 KiFS 在 32 位保护模式内核里的实现（x86，nasm `-f bin` 平铺内核，无分页依赖）。
-当前为 **Phase C1**：只读 + 写入（journal + CoW），已通过 48 项内核侧/宿主侧交叉验证。
+当前为 **Phase C1（v1 格式）**：只读 + 写入（journal + CoW），已通过 48 项内核侧/宿主侧交叉验证。
+
+> ⚠️ **格式 v2（2026-11-15）**：宿主 `tools/mkifs.py` 已升级到 v2（`version=0x00020000`，
+> 支持 4096/16384 块、u64 size、extent `(u64,u32)`、1M record）。本目录的 v1 驱动读到
+> v2 镜像会因版本不符拒绝；升级要点见 [docs/integration.md](../docs/integration.md) 顶部
+> 与 [docs/kifs-v2.md](../docs/kifs-v2.md) §5。
 
 ## 定位
 

@@ -3,6 +3,13 @@
 本文以 KKernel（https://github.com/KaiXinLee114514/KKernel）为参考，说明 `kernel/kifs.asm` 的接入方式。
 驱动本身是**自包含的 nasm 平铺代码**，不需要分页/虚拟内存支持，只需要宿主提供下面几个原语。
 
+> ⚠️ **格式 v2（2026-11-15）**：本仓库 `kernel/kifs.asm` 目前仍是 **v1** 实现，
+> 只认 `version=0x00010000` 与 4096 B 块。宿主 `mkifs.py` 现在默认生成 **v2**
+> （`0x00020000`）镜像，v1 驱动会拒绝。内核侧需要按
+> [docs/kifs-v2.md](kifs-v2.md) 升级：读 `block_size`、16 KiB 块缓冲、LBA48、
+> Record 的 `size_hi/blocks_hi`、extent `(start u64,count u32)`、journal payload=块大小-20。
+> 在升级完成前，内核测试要自己造 v1 镜像，或把 `MKIFS_VERSION` 之类的旧参数留一份。
+
 ## 1. 依赖的宿主原语
 
 | 原语 | 参考实现（KKernel） | 说明 |
@@ -34,14 +41,21 @@
 
 两选一：
 
-**A. 宿主生成（推荐开发期）**：用 `tools/mkifs.py` 造 4 MiB 卷，`dd` 到磁盘镜像的 LBA 22528：
+**A. 宿主生成（推荐开发期）**：用 `tools/mkifs.py` 造卷，`dd` 到磁盘镜像的 LBA 22528。
+v2 推荐 16 KiB 块（CI 小镜像可用 4 KiB）：
 
 ```bash
+# 4 KiB 块小镜像（4 MiB）
 python3 tools/mkifs.py format /tmp/kifs-part.img --size-mib 4
+# 或 16 KiB 块（64 MiB 起，大卷更省元数据）
+python3 tools/mkifs.py format /tmp/kifs-part.img --size-mib 64 --block-size 16384
 python3 tools/mkifs.py mkdir  /tmp/kifs-part.img /docs
 python3 tools/mkifs.py write  /tmp/kifs-part.img /docs/hello.txt --data "hello kifs"
 dd if=/tmp/kifs-part.img of=build/hd.img bs=512 seek=22528 conv=notrunc
 ```
+
+大卷（LBA48 测试）示例：`--size-mib 15728640 --block-size 16384` 生成 15 TiB 稀疏卷，
+实盘只占 ~250 MiB；内核要用 LBA48 才能寻址超过 128 GiB 的偏移。
 
 **B. 内核自己写**：卷是空的也行——`kifs_init` 需要合法 superblock，可先用宿主 format 一次，之后内核侧的
 `kifs mkdir/write/rm` 会走 journal+CoW 自行维护。
@@ -51,7 +65,7 @@ dd if=/tmp/kifs-part.img of=build/hd.img bs=512 seek=22528 conv=notrunc
 
 ## 4. 测试
 
-- 宿主机自测：`python3 tools/test_mkifs.py`（15 项）、`python3 tools/test_journal.py`（29 项断电注入）。
+- 宿主机自测：`python3 tools/test_mkifs.py`（192 项，4K+16K）、`python3 tools/test_journal.py`（91 项断电注入，4K+16K）。
 - 内核侧（KKernel 参考）：`make test-kifs` → 48 项断言，包括：
   - 内核写路径（mkdir/write/cat/stat/ls/journal/rm）
   - reboot 后持久化
@@ -62,4 +76,6 @@ dd if=/tmp/kifs-part.img of=build/hd.img bs=512 seek=22528 conv=notrunc
 
 - 时间戳：内核侧 `kifs_now` 恒 0（ctime/mtime 写 0），宿主 fsck 不检查。
 - `kifs write <path> <text>` 文本参数受内核 shell 行缓冲限制（KKernel 为 128 字符），大文件用管道。
-- journal 64 槽环形复用，与宿主工具一致。
+- journal 64 槽环形复用，与宿主工具一致；payload 长度 = `block_size-20`（v2）。
+- v2 内联 record：`inline_len>0` 时 record 36..128 全是文件内容，`size=inline_len`、`blocks=0`，
+  不要解析 owner/size_hi/extent。
