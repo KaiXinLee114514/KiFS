@@ -90,6 +90,10 @@ def _locked(fn):
         with self._mutex:
             try:
                 return fn(self, *args, **kwargs)
+            except FuseOSError:
+                # FuseOSError 是 OSError 子类，必须先于 OSError 捕获：
+                # 正常的 ENOENT/EACCES 等控制流异常不能回滚未提交事务！
+                raise
             except OSError:
                 self._rollback()
                 raise
@@ -97,8 +101,6 @@ def _locked(fn):
                 self._rollback()
                 log.error("KiFS 内部错误: %s", e)
                 raise FuseOSError(errno.EIO)
-            except FuseOSError:
-                raise
             except Exception:
                 self._rollback()
                 log.exception("FUSE 操作 %s 异常", fn.__name__)
@@ -110,6 +112,9 @@ class KifsFS(Operations):
     def __init__(self, image, offset=0, read_only=False, allow_hidden=False):
         self.read_only = bool(read_only)
         self.allow_hidden = bool(allow_hidden)
+        self._dirty = False          # 延迟 journal 提交（写路径只打标记）
+        self._dirty_bytes = 0        # 累积脏字节，超过阈值强制提交一次
+        self._wb = None              # 顺序写合并缓冲: (rec, start_off, bytearray)
         self.uid = os.getuid()
         self.gid = os.getgid()
         self._mutex = threading.RLock()
@@ -222,11 +227,40 @@ class KifsFS(Operations):
     def _flush(self):
         self.img.flush()
 
+    def _commit_if_dirty(self):
+        """把累积的元数据增量一次性提交 journal。
+
+        write() 不再逐次提交（那是 0.4 MiB/s 的元凶）；
+        数据块在 write_at 里已直接落盘，元数据（位图/record）这里一次提交。
+        """
+        if self._dirty:
+            self.img.flush()
+            self._dirty = False
+            self._dirty_bytes = 0
+
     # ------------------------------------------------------------------
     # 元数据
     # ------------------------------------------------------------------
+    def _wb_flush(self):
+        """把顺序写合并缓冲整段提交：一次 write_at，避免 4 KiB 一哆嗦。"""
+        wb = self._wb
+        if not wb:
+            return
+        self._wb = None
+        rec, start, buf, _fh = wb
+        if not buf:
+            return
+        self.img.write_at(rec, start, bytes(buf))
+        rec.mtime = int(time.time())
+        self.img.write_record(rec)
+        self._dirty = True
+        self._dirty_bytes += len(buf)
+        if self._dirty_bytes >= 128 * 1024 * 1024:
+            self._commit_if_dirty()
+
     @_locked
     def getattr(self, path, fh=None):
+        self._wb_flush()
         rec = self._need(path)
         return self._attrs(rec)
 
@@ -247,6 +281,7 @@ class KifsFS(Operations):
 
     @_locked
     def statfs(self, path):
+        self._wb_flush()
         info = self.img.statfs_info()
         return {
             "f_bsize": info["block_size"],
@@ -262,6 +297,7 @@ class KifsFS(Operations):
 
     @_locked
     def readdir(self, path, fh):
+        self._wb_flush()
         rec = self._need_dir(path)
         names = ["."]
         if path != "/":
@@ -317,12 +353,13 @@ class KifsFS(Operations):
     # ------------------------------------------------------------------
     @_locked
     def open(self, path, flags):
+        self._wb_flush()
         rec = self._need_file(path)
         if (flags & os.O_ACCMODE) != os.O_RDONLY:
             self._check_write(rec)
         else:
             self._check_read(rec)
-        return 0
+        return rec.oid          # 用 oid 当 fh，后续读写直接按 oid 查 record，省去路径解析
 
     @_locked
     def create(self, path, mode, fi=None):
@@ -340,23 +377,29 @@ class KifsFS(Operations):
 
     @_locked
     def read(self, path, size, offset, fh):
-        rec = self._need_file(path)
+        self._wb_flush()
+        rec = self.img.read_record(fh) if fh else self._need_file(path)
         self._check_read(rec)
         return self.img.read_at(rec, offset, size)
 
     @_locked
     def write(self, path, data, offset, fh):
-        rec = self._need_file(path)
-        self._check_write(rec)
-        self.img.write_at(rec, offset, data)
-        rec.mtime = int(time.time())
-        self.img.write_record(rec)
-        self._flush()
+        wb = self._wb
+        if wb is not None and fh and wb[3] == fh and wb[1] + len(wb[2]) == offset:
+            wb[2].extend(data)                 # 热路径：同一 fh 顺序写，只记缓冲
+        else:
+            self._wb_flush()
+            rec = self.img.read_record(fh) if fh else self._need_file(path)
+            self._check_write(rec)
+            self._wb = (rec, offset, bytearray(data), fh)
+        if len(self._wb[2]) >= 4 * 1024 * 1024:  # 每 4 MiB 提交一次，限制内存
+            self._wb_flush()
         return len(data)
 
     @_locked
     def truncate(self, path, length, fh=None):
-        rec = self._need_file(path)
+        self._wb_flush()
+        rec = self.img.read_record(fh) if fh else self._need_file(path)
         self._check_write(rec)
         self.img.truncate_at(rec, length)
         rec.mtime = int(time.time())
@@ -366,11 +409,14 @@ class KifsFS(Operations):
 
     @_locked
     def flush(self, path, fh):
-        self._flush()
+        self._wb_flush()
+        self._commit_if_dirty()
         return 0
 
     @_locked
     def fsync(self, path, datasync, fh):
+        self._wb_flush()
+        self._commit_if_dirty()
         self.img.flush()
         try:
             os.fsync(self.img.fh.fileno())
@@ -384,7 +430,16 @@ class KifsFS(Operations):
 
     @_locked
     def release(self, path, fh):
+        self._wb_flush()
+        self._commit_if_dirty()
         return 0
+
+    def destroy(self, path=None):
+        try:
+            self._wb_flush()
+            self._commit_if_dirty()
+        except Exception:
+            log.exception("destroy 提交 journal 失败")
 
     # ------------------------------------------------------------------
     # 命名空间
@@ -399,6 +454,7 @@ class KifsFS(Operations):
 
     @_locked
     def unlink(self, path):
+        self._wb_flush()
         parent, _name = self.img.parent_record(path)
         self._check_dir_write(parent)
         self.img.unlink_at(path)
@@ -415,6 +471,7 @@ class KifsFS(Operations):
 
     @_locked
     def rename(self, old, new):
+        self._wb_flush()
         if self.read_only:
             raise FuseOSError(errno.EROFS)
         op, _on = self.img.parent_record(old)

@@ -712,6 +712,22 @@ class Image(object):
         b = self._read_bytes(self._bitmap_off() + blk // 8, 1)[0]
         return (b >> (blk % 8)) & 1
 
+    def bits_set_range(self, lo, n, val=1):
+        """批量把位图 [lo, lo+n) 置 val：按字节合并写，比逐 bit 快几十倍。"""
+        while n > 0:
+            byte_idx = lo // 8
+            bit0 = lo % 8
+            take = min(n, 8 - bit0)
+            off = self._bitmap_off() + byte_idx
+            b = self._read_bytes(off, 1)[0]
+            mask = ((1 << take) - 1) << bit0
+            nb = (b | mask) if val else (b & ~mask & 0xFF)
+            if nb != b:
+                self._write_bytes(off, bytes([nb]))
+                self.mark(self.sb.data_start, byte_idx, 1)
+            lo += take
+            n -= take
+
     def bit_set(self, blk, val=1):
         off = self._bitmap_off() + blk // 8
         b = self._read_bytes(off, 1)[0]
@@ -1290,14 +1306,17 @@ class Image(object):
         base = st + cnt
         if base != self.sb.data_next:
             return False                      # 尾部不连续 → 走 CoW 路径（避免碎片）
+        if base + n_new > self.sb.meta_next:
+            return False
+        if self.bits_value(base, n_new):
+            return False                      # 有块已占用
+        # 数据块先落盘（提交前是孤儿，安全）——整段一次写，别按 16K 一哆嗦
+        self._disk_write(base * self.bs, data)
         for b in range(base, base + n_new):
-            if b >= self.sb.meta_next or self.bit_get(b):
-                return False
-        # 数据块先落盘（提交前是孤儿，安全），再改位图/record（走 journal）
-        for i in range(n_new):
-            self.write_data_block(base + i, data[i * self.bs:(i + 1) * self.bs])
-        for b in range(base, base + n_new):
-            self.bit_set(b, 1)
+            self._cache.pop(b, None)
+            self._dirty.discard(b)
+        # 再改位图/record（走 journal）——位图按字节批量置位
+        self.bits_set_range(base, n_new, 1)
         self.sb.data_next = base + n_new
         self.sb.free_blocks -= n_new
         exts[-1] = (st, cnt + n_new)
