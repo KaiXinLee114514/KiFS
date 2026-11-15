@@ -92,7 +92,8 @@ kifs journal
     21 项断言；验证 LBA48 高地址的 read/write/cat/ls/stat/journal。
   - `make test-kifs-crash`：真断电注入（SIGKILL 循环）。
 - 宿主交叉验证：测试后按真实分区 LBA 从镜像抽取卷，用 `tools/mkifs.py fsck` + `read` 做字节级比对。
-- 宿主自测：`tools/test_mkifs.py`（192 项，4K+16K）、`tools/test_journal.py`（91 项断电注入）。
+- 宿主自测：`tools/test_mkifs.py`（228 项，4K+16K，含符号链接）、`tools/test_journal.py`
+  （111 项断电注入，含符号链接创建/删除）。
 
 ## 已知偏差 / TODO
 
@@ -100,4 +101,8 @@ kifs journal
 - `kifs write <path> <text>` 的文本参数受内核 shell 行缓冲 128 字符限制；大文件请用管道 stdin。
 - journal 64 槽环形复用，与宿主 mkifs.py 行为一致。
 - 单块位图限制（见上）。
+- **符号链接（type=3）**：本期未改内核驱动，宿主工具/FUSE 已支持（见
+  [docs/kifs.md](../docs/kifs.md) §6.1）。参考驱动遇到 type=3 时的显示行为：
+  `kifs ls` 把链接当普通项显示 `-`（不显示 `-> target`）、大小显示目标字节数；
+  `kifs stat` 类型显示 `file`；`kifs cat` 报「不是文件」且**不跟随链接**。
 - C2（真机断电注入压测）未做。

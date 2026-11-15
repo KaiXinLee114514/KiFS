@@ -1,6 +1,6 @@
 # KiFS 设计稿（Kai File System）
 
-> 版本 0.1 · 2026-11-14 · 状态：设计定稿（尚未实现）
+> 版本 0.1 · 2026-11-14 · 状态：设计定稿（v2 已实现；v2.1 增加符号链接）
 >
 > 一句话：KiFS 是一个以「对象 + 倒排关键词索引」为核心的 4K 块文件系统——
 > 目录只是视图，语义查询是一等公民。
@@ -106,7 +106,7 @@ Record 表放在位图之后：`record_start` 起，槽号即 OID。v2 用 `size
 | 偏移 | 大小 | 字段 | 说明 |
 |---:|---:|---|---|
 | 0 | 4 | `oid` | 自身 OID（冗余校验，应等于槽号） |
-| 4 | 1 | `type` | 1=file，2=dir，3=symlink（预留） |
+| 4 | 1 | `type` | 1=file，2=dir，3=symlink（v2.1 已实现） |
 | 5 | 1 | `flags` | 0x01=system，其余预留 |
 | 6 | 2 | `perm` | 16 位权限/属性字：bit0-8 = `rwxrwxrwx`，bit9 = hide，bit10 = ro，bit11 = iolock |
 | 8 | 4 | `size_lo` | 文件字节数低 32 位 |
@@ -154,6 +154,28 @@ Record 表放在位图之后：`record_start` 起，槽号即 OID。v2 用 `size
 - `entry_len - 8 - name_len` 的尾部字节为 0。
 - 目录项 `type` 与 record 的 `type` 应一致，不一致视为损坏（fsck 报）。
 - 根目录（OID=1）的 `parent=0`，名字为空。
+
+### 6.1 符号链接（type=3，v2.1）
+
+- **存储**：record 的 `type=3`；内容就是目标路径的 UTF-8 字节（不含结尾 NUL），
+  `size` = 目标字节数；内容完全复用文件内容存储——≤92 B 内联，更长为 extent
+  （宿主一次写一个连续 extent）。因为内联会覆盖 record 尾部字段，内联符号链接的
+  `owner` 为空，与内联文件一致。
+- **目标上限**：1024 B；超过即拒绝（宿主工具报错，FUSE 返回 `ENAMETOOLONG`）。
+- **语义**：目标可以是绝对或相对路径，**允许 dangling**（指向不存在的对象）；
+  文件系统层不做路径解析/跟随——`readlink` 只读出原始字节，跟随由 VFS（Linux
+  FUSE 挂载）完成。因此目录项里只要 `type` 一致即可，fsck 也不会去解析目标。
+- **权限**：默认 `perm=0777`；FUSE 里 `st_mode` 恒为 `S_IFLNK|0777`，`st_size` 为
+  目标字节数，`st_nlink=1`。`chmod` 对符号链接本身没有意义（VFS 通常先跟随）。
+- **删除**：`unlink` 只删除链接 record + 目录项，不触碰目标对象。
+- **防御**：即使 VFS 已解析，驱动仍对 `open`/`read`/`write`/`truncate` 直接指向
+  符号链接的请求返回 `EINVAL`；`readdir` 对 type=3 项上报 `DT_LNK`。
+- **fsck**：接受 type=3，并检查目标 ≤1024 B、无 NUL、是合法 UTF-8；dangling 不算错误。
+- **FAT16 对比**：FAT 目录项没有「链接」类型，无法表达 `ln -s`；KiFS 直接复用
+  record + 目录项 + 内容存储，代价是 1 个 record 槽（目标 ≤92 B 时不占数据块）。
+- **宿主命令**：`python3 tools/mkifs.py symlink IMG /path --target TARGET [--perm ...]`、
+  `python3 tools/mkifs.py readlink IMG /path`；`ls` 显示 `l` 前缀和 `-> target`，
+  `stat` 显示 `type: symlink` 与 `target:`。
 
 ---
 
@@ -268,6 +290,7 @@ rwxrwxrwx111kai
 | 权限 | 无 | perm + hide/ro |
 | 查询 | 无 | 关键词倒排 + 语义查询 |
 | 目录 | 扁平目录项 | 有序目录项（Subindex 预留） |
+| 符号链接 | 无（目录项没有链接类型） | type=3，目标复用文件内容存储（≤1024 B） |
 | 实现成本 | 低 | 中（但宿主 + 内核双实现可互验） |
 
 **迁移路径**：先做 `tools/mkifs.py` 生成镜像 + `fsck` 校验；再给 KKernel 加
@@ -285,6 +308,10 @@ rwxrwxrwx111kai
     record 上限 1M、大卷稀疏 format（15 TiB 只写 ~249 MiB 元数据）。
     自测：`tools/test_mkifs.py` 192 项（4K+16K）、`tools/test_journal.py` 91 项
     （4K+16K × 5 种断电注入）。
+  - **A3.1 = 符号链接（已完成，2026-11-15）**：record type=3，目标路径复用
+    inline/extent 存储、上限 1024 B、允许 dangling；`mkifs symlink/readlink` +
+    FUSE `symlink/readlink/getattr/readdir`。自测：`test_mkifs.py` 228 项、
+    `test_journal.py` 111 项（新增符号链接创建/删除断电注入）。
   - Python 单文件；CI 用 4 KiB 块小镜像，大卷用 16 KiB 块；与设计表逐字节对齐
 - **Phase B（内核只读）**：`kernel/kifs.asm`
   - **B0（已完成，2026-11-14，v1 格式）**：KKernel 里的只读驱动 + `kifs` 命令组 ——
@@ -315,6 +342,7 @@ rwxrwxrwx111kai
 | 内联上限 | 92 B（数据占 record 36..128） |
 | 内联 extent | 3 个，每项 12 B：`start u64 + count u32` |
 | 文件大小 | u64：`size_lo@8` + `size_hi@100`；blocks 同理 `@12/@104` |
+| 符号链接目标 | ≤1024 B UTF-8（无 NUL，允许 dangling），默认 perm 0777 |
 | 目录项头 | 8 B，名字 UTF-8，4 对齐 |
 | journal 头 | 20 B：`'KJRN'` + seq u32 + flags u16 + offset u16 + target u32 + len u16 + crc16 |
 | 默认 journal | 64 块（4K=256 KiB，16K=1 MiB） |
@@ -374,7 +402,7 @@ rwxrwxrwx111kai
   位图标记数与所有 extent 声明块数一致、size/blocks 与 extent 总块数一致、
   目录项类型一致、孤立 record、superblock 三副本一致。
 - **实测**：64 GiB/16K format 写 9.5 MiB、15 TiB/16K format 写 249 MiB（0.22s）、
-  15 TiB fsck 0.54s；192 + 91 项自测通过。
+  15 TiB fsck 0.54s；192 + 91 项自测通过（v2 时点；加入符号链接后为 228 + 111）。
 - **历史**：A2（v1 journal/CoW）记录已由 v2 取代；`KIFS_CRASH` 五种注入点语义不变。
 
 ---
@@ -387,3 +415,29 @@ rwxrwxrwx111kai
 - **注入点**：`KIFS_CRASH=after_begin|after_records|after_commit|after_apply|torn`（torn 会在 COMMIT 前写坏最后一条记录的 payload CRC）。
 - **验证结论**：after_begin/after_records/torn → 内容保持旧值（事务丢弃）；after_commit/after_apply → 内容为新值（重放幂等）；所有场景重开 fsck 通过、无悬挂事务；CoW 重写实测新旧 extent 起点不同，旧块被正确释放。
 - **注意**：本节是 v1 时代记录，v2 的 journal 格式与注入点语义不变，但 payload 长度与块大小相关。
+
+---
+
+## 18. 实现记录：符号链接 type=3（v2.1，2026-11-15）
+
+- **格式**：record `type=3`；`size` = 目标路径 UTF-8 字节数，内容复用 `write_content`
+  的 inline（≤92 B）/ extent 路径；目标上限 1024 B，允许 dangling，不做文件系统层解析。
+  目录项 `type` 同步为 3，`unlink` 走普通非目录分支（只删链接自身）。
+- **宿主工具**（`tools/mkifs.py`）：新增 `TYPE_SYMLINK=3`、`PERM_SYMLINK_DEFAULT=0o777`、
+  `SYMLINK_TARGET_MAX=1024`；`Image.symlink/readlink`；`write_file`/`read_file` 遇到
+  符号链接明确报「是符号链接」；`ls` 用 `l` 前缀并追加 `-> target`，`stat` 增加
+  `type: symlink` 与 `target:`；fsck 接受 type=3，检查目标长度/NUL/UTF-8 并统计数量；
+  CLI 增加 `symlink` / `readlink`。
+- **FUSE**（`linux/fuse_kifs.py`）：`getattr` 对 type=3 返回 `S_IFLNK|0777`、`st_size`=
+  目标字节数、`st_nlink=1`；`symlink` 注意 fusepy 参数顺序为 `(target=新链接路径,
+  source=目标路径)`；`readlink` 返回目标字符串；`readdir` 对 type=3 上报 `DT_LNK`；
+  `open/read/write/truncate` 遇到符号链接防御性返回 `EINVAL`；超长目标
+  `ENAMETOOLONG`、重名 `EEXIST`。
+- **测试**：`tools/test_mkifs.py` 新增 36 项（中文/emoji、dangling、指向目录、
+  1024/1025 B 边界、重名、unlink 不动目标、fsck 计数）；`tools/test_journal.py`
+  新增符号链接创建（after_records 丢弃 / after_commit 重放）与删除重放共 20 项；
+  `linux/test_fuse.sh` 增加 `[符号链接]` 小节；`linux/test_image_api.py` 增加
+  内联/长目标块级 API 断言。
+- **文档**：`docs/kifs.md`（本节 + §6.1 + 类型表/常量表/FAT 对比）、`README.md`、
+  `linux/README.md`、`kernel/README.md`（参考驱动的显示行为：`ls` 仍显示 `-`，
+  `stat` 显示 file，`cat` 报非文件，且不跟随链接；内核驱动本期不改）。

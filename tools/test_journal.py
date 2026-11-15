@@ -119,6 +119,34 @@ def suite(work, bs, mib):
     ok(run(["fsck", cimg]).returncode == 0, "%s 释放块后 fsck（free_blocks 一致）" % tag)
 
 
+    # --- 符号链接（type=3）的断电注入：创建丢弃/重放 + 删除重放 ---
+    sym_target = "/" + "t" * 199          # >92 B：目标走 extent 数据块
+    for point, present in (("after_records", False), ("after_commit", True)):
+        cimg = os.path.join(work, "sym-%s-%d.img" % (point, bs))
+        shutil.copy(base, cimg)
+        r = run(["symlink", cimg, "/ln", "--target", sym_target], {"KIFS_CRASH": point})
+        ok(r.returncode == 2, "%s symlink %s: rc=2 (实际 %d)" % (tag, point, r.returncode))
+        rl = run(["readlink", cimg, "/ln"])
+        got = rl.stdout.decode().strip()
+        if present:
+            ok(rl.returncode == 0 and got == sym_target,
+               "%s symlink %s: 重放后链接存在且目标正确" % (tag, point))
+        else:
+            ok(rl.returncode != 0,
+               "%s symlink %s: 丢弃后链接不存在" % (tag, point))
+        ok(run(["fsck", cimg]).returncode == 0, "%s symlink %s: 恢复后 fsck" % (tag, point))
+
+    dlimg = os.path.join(work, "sym-del-%d.img" % bs)
+    shutil.copy(base, dlimg)
+    ok(run(["symlink", dlimg, "/ln", "--target", "/f"]).returncode == 0,
+       "%s 准备符号链接 /ln" % tag)
+    r = run(["rm", dlimg, "/ln"], {"KIFS_CRASH": "after_commit"})
+    ok(r.returncode == 2, "%s symlink 删除 after_commit: rc=2" % tag)
+    ok(run(["readlink", dlimg, "/ln"]).returncode != 0,
+       "%s symlink 删除重放后链接消失" % tag)
+    ok(run(["fsck", dlimg]).returncode == 0, "%s symlink 删除重放后 fsck" % tag)
+
+
 def inprocess_recover(work):
     """同进程恢复：Image() 构造里重放后，superblock 必须刷新为盘上新值。"""
     import mkifs

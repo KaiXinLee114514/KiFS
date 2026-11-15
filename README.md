@@ -2,10 +2,11 @@
 
 一个以「对象 + 倒排关键词索引」为核心的块文件系统（块大小 4 / 16 KiB）—— 目录只是视图，语义查询是一等公民。
 
-> 状态：**v0.4 · 格式 v2**（2026-11-15）——宿主工具已升级 v2：16 KiB 块、u64 文件大小、
-> 1M record、单卷 64 TiB、大卷稀疏 format。测试：`tools/test_mkifs.py` 192 项、
-> `tools/test_journal.py` 91 项（4K+16K）。本仓库 `kernel/` 下的汇编驱动仍是 v1 格式，
-> 需要按 v2 规格升级（见 [docs/integration.md](docs/integration.md)）。
+> 状态：**v0.5 · 格式 v2 + 符号链接**（2026-11-15）——宿主工具支持 16 KiB 块、u64 文件大小、
+> 1M record、单卷 64 TiB、大卷稀疏 format，以及 record `type=3` 符号链接。测试：
+> `tools/test_mkifs.py` 228 项、`tools/test_journal.py` 111 项（4K+16K）。
+> 本仓库 `kernel/` 下的汇编驱动已同步 v2（读写/journal/CoW），但尚未专门支持
+> 符号链接（显示行为见 [kernel/README.md](kernel/README.md)）。
 > 设计稿：[docs/kifs.md](docs/kifs.md) · v2 规格：[docs/kifs-v2.md](docs/kifs-v2.md) · 集成指南：[docs/integration.md](docs/integration.md)
 > Linux 可用 FUSE 直接挂载（读写走 journal+CoW）：[linux/README.md](linux/README.md)
 
@@ -14,6 +15,7 @@
 - 盘头 Superblock（带备份）→ 块位图 / Record 表 / 数据块向上长
 - 关键词串池 / Subindex / Journal（redo）从盘尾向下长，双游标
 - Record 128 B：oid/type/flags/perm(16 位)/size(u64)/时间/parent/kw_index/owner + 小文件内联 ≤92 B + 最多 3 个内联 extent
+- 符号链接：`type=3`，目标路径（≤1024 B，允许 dangling）复用内联/extent 存储；`ln -s`/`readlink` 可用
 - v2：`size_lo/size_hi` 与 `blocks_lo/blocks_hi` 拼 u64；extent 每项 12 B `(start u64, count u32)`；
   `record_count = min(max(16, total_blocks//64), 1<<20)`
 - 权限展示：`rwxrwxrwx111kai`（9 位 rwx + 3 位 hide/ro/iolock + 用户名；hide/ro/iolock 都是 perm 位）
@@ -32,13 +34,13 @@ kifs/
 │   ├── kifs.asm          KiFS 内核驱动（x86 nasm 平铺，Phase C1 读写+journal+CoW）
 │   └── README.md         驱动说明（命令/内存布局/写入语义/测试）
 ├── tools/
-│   ├── mkifs.py          宿主工具（v2）：format/mount/mkdir/write/read/ls/stat/rm/info/fsck/journal
-│   ├── test_mkifs.py     宿主自测 192 项（4 KiB + 16 KiB）
-│   └── test_journal.py   断电注入自测 91 项（4K+16K × after_begin/records/commit/apply/torn）
+│   ├── mkifs.py          宿主工具（v2）：format/mount/mkdir/write/read/symlink/readlink/ls/stat/rm/info/fsck/journal
+│   ├── test_mkifs.py     宿主自测 228 项（4 KiB + 16 KiB，含符号链接）
+│   └── test_journal.py   断电注入自测 111 项（4K+16K × 断电点 + 符号链接创建/删除）
 ├── linux/
 │   ├── fuse_kifs.py      FUSE 驱动（挂载镜像/块设备，读写走 Image 的 journal+CoW）
 │   ├── test_fuse.sh      端到端测试：真挂载→POSIX 操作→卸载→fsck+字节比对
-│   ├── test_image_api.py Image 块级 API 自测（inline/随机写/ext_index/truncate）
+│   ├── test_image_api.py Image 块级 API 自测（inline/随机写/ext_index/truncate/符号链接）
 │   ├── requirements.txt  fusepy>=3.0（装进仓库 .venv）
 │   └── README.md         依赖/挂载卸载/权限/限制/排障
 └── README.md
@@ -50,7 +52,7 @@ kifs/
 
 | Phase | 内容 | 状态 |
 |---|---|---|
-| A | `tools/mkifs.py` 宿主（format/mkdir/write/read/ls/stat/rm/info/fsck/journal）+ 测试镜像 | ✅ v2 完成（**16 KiB 块 / u64 / 1M record / 大卷**）|
+| A | `tools/mkifs.py` 宿主（format/mkdir/write/read/symlink/readlink/ls/stat/rm/info/fsck/journal）+ 测试镜像 | ✅ v2 + 符号链接完成（**16 KiB 块 / u64 / 1M record / 大卷 / type=3**）|
 | B | 内核只读驱动（挂载 /MNT/KIFS） | ✅ B0：只读驱动 + `kifs info/ls/cat/stat`（KKernel `kifs-phase-b` 分支）|
 | C | 内核写入 + journal + 断电注入测试 | ✅ C1：内核写入 + journal + CoW（`kifs-phase-c` 分支，48 项断言）；C2 真机 kill -9 压测待做 |
 | D | keywords 倒排 + 语义查询 | 未开始 |
@@ -68,6 +70,8 @@ python3 tools/mkifs.py mkdir  /tmp/kifs.img /docs
 python3 tools/mkifs.py write  /tmp/kifs.img /docs/hello.txt --data "hello kifs"
 python3 tools/mkifs.py read   /tmp/kifs.img /docs/hello.txt
 python3 tools/mkifs.py ls     /tmp/kifs.img /docs
+python3 tools/mkifs.py symlink /tmp/kifs.img /docs/link --target hello.txt
+python3 tools/mkifs.py readlink /tmp/kifs.img /docs/link
 python3 tools/mkifs.py info   /tmp/kifs.img      # 布局/版本/record_count
 python3 tools/mkifs.py fsck   /tmp/kifs.img
 ```
@@ -78,8 +82,8 @@ python3 tools/mkifs.py fsck   /tmp/kifs.img
 自测：
 
 ```bash
-python3 tools/test_mkifs.py     # 192 项：4K/16K 功能 + u64/extent/record 上限/大卷
-python3 tools/test_journal.py   # 91 项：4K+16K × 5 种断电注入 + CoW
+python3 tools/test_mkifs.py     # 228 项：4K/16K 功能 + u64/extent/record 上限/大卷/符号链接
+python3 tools/test_journal.py   # 111 项：4K+16K × 断电注入 + CoW + 符号链接创建/删除
 ```
 
 内核侧（KKernel 参考仓库的 `kifs-phase-c` 分支）：
@@ -114,15 +118,16 @@ tools/mkifs.py fsck /tmp/kifs.img
   （单线程、不支持稀疏文件、盘满 ENOSPC、ext_index 碎片化）见 [linux/README.md](linux/README.md)。
 - **测试**：`linux/test_fuse.sh` —— 4K/4MiB 与 16K/64MiB 两张镜像，挂载→
   mkdir/cp/dd/rename/chmod/truncate/append→卸载→`fsck` 必过 + 离线字节比对；
-  root 下会额外跑 loop 块设备路径。
+  另有 `[符号链接]` 小节与 root 下的 loop 块设备路径。
 
 ## 内核驱动快速上手
 
 - 复制 `kernel/kifs.asm` 进内核，`%include` 在 ATA 驱动之后，启动时 `call kifs_init`（没有卷就静默跳过）。
 - 命令：`kifs info / ls / cat / stat / mkdir / write / rm / journal`。
 - 固定分区 LBA 22528（11 MiB），不挂 VFS；写入走 journal（KJRN+CRC16）与 CoW。
-- **v2 变更（内核侧待跟进）**：从 superblock 读 `block_size`（4K/16K）、16 KiB 块缓冲、
-  LBA48 寻址、Record 的 `size_hi/blocks_hi`、extent `(u64,u32)`、journal payload=`block_size-20`。
+- **v2 格式**：从 superblock 读 `block_size`（4K/16K）、16 KiB 块缓冲、LBA48 寻址、
+  Record 的 `size_hi/blocks_hi`、extent `(u64,u32)`、journal payload=`block_size-20`
+  （内核侧已在 `kifs-v2` 分支落地）。
 - 详细接入与依赖见 [docs/integration.md](docs/integration.md) 和 [kernel/README.md](kernel/README.md)。
 
 ## 为什么不开源（暂时）

@@ -65,7 +65,13 @@ fusermount3 -u /mnt/kifs      # 卸载（新版 fuse3；老系统用 fusermount 
 已接入的 FUSE 操作：`readdir`、`getattr`、`access`、`open`、`read`、`write`、
 `create`、`mknod`、`mkdir`、`unlink`、`rmdir`、`rename`、`truncate`、`chmod`、
 `chown`（实现为 no-op/校验）、`utimens`、`statfs`、`flush`、`fsync`、`fsyncdir`、
-`release`、`destroy`。
+`release`、`destroy`、`symlink`、`readlink`。
+
+符号链接：`ln -s 目标 链接` 写入 record `type=3`，目标最长 1024 B（UTF-8，允许
+dangling），`ls -l` 显示 `l` 与 `-> 目标`，`readlink` 原样返回目标；解析由 VFS
+完成，驱动不跟随。`unlink` 只删链接本身；对链接直接 `open/read/write/truncate`
+防御性返回 `EINVAL`（正常路径已被 VFS 解析）。超长目标 `ENAMETOOLONG`、重名
+`EEXIST`。
 
 KiFS 的 16 位 `perm` 低 9 位是 **r=1、w=2、x=4**（与 POSIX 的 r=4、w=2、x=1 相反），
 驱动负责双向转换，`ls -l` 看到的是正常 rwx。高 3 位是特殊位：
@@ -77,8 +83,8 @@ KiFS 的 16 位 `perm` 低 9 位是 **r=1、w=2、x=4**（与 POSIX 的 r=4、w=
 
 `--read-only` 挂载会让整个文件系统只读（内核 `MS_RDONLY`），与单文件 `ro` 位叠加。
 所有文件 `st_uid/st_gid` 报为挂载用户（KiFS 只存 owner 名字，没有 uid/gid）。
-KiFS 没有硬链接/符号链接/扩展属性：`link`/`symlink` 返回 `ENOTSUP`，
-xattr 的 set/remove 返回 `ENOTSUP`、get/list 返回空。
+KiFS 没有硬链接/扩展属性：`link` 返回 `ENOTSUP`，xattr 的 set/remove 返回
+`ENOTSUP`、get/list 返回空；符号链接支持 `type=3`（见本节）。
 
 ## 4. 块设备（裸分区 / 整盘）
 
@@ -130,7 +136,8 @@ fusermount3 -u /mnt/kifs    # root 下也可用 umount /mnt/kifs
 - **崩溃恢复**：挂载时自动重放 journal（`Image.recover()`）；如果镜像在别的
   机器/进程手里被写坏，驱动会在写失败时 `reload + recover` 一次并把错误返回给
   应用（EIO）。
-- **扩展属性/ACL/硬链接/符号链接**：不支持（见 §3）。
+- **扩展属性/ACL/硬链接**：不支持；符号链接支持 `type=3`（目标 ≤1024 B，允许
+  dangling，见 §3）。
 - 大卷（15 TiB 稀疏镜像）format 只写元数据（~249 MiB），挂载后 `df` 显示的是
   KiFS 的 `statfs` 数字（总块数/空闲块数），不是宿主文件系统。
 

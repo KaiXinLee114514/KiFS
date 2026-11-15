@@ -66,6 +66,10 @@ PERM_GROUP_R = 1 << 3
 PERM_OTHER_R = 1 << 6
 PERM_FILE_DEFAULT = PERM_OWNER_RW | PERM_GROUP_R | PERM_OTHER_R
 PERM_DIR_DEFAULT = 0b111 | (0b101 << 3) | (0b101 << 6)
+PERM_SYMLINK_DEFAULT = 0o777
+
+# 符号链接目标上限（UTF-8 字节数，不含结尾 NUL）
+SYMLINK_TARGET_MAX = 1024
 
 SUPER_STRUCT = struct.Struct("<4s14I16s32sI")   # 112 B，后接 400 B reserved
 REC_HEAD = struct.Struct("<IBBHIIIIIIBBH")      # 前 36 B（v2）
@@ -73,7 +77,7 @@ EXT_STRUCT = struct.Struct("<QI")               # 12 B：start u64, count u32（
 DIRENT_HEAD = struct.Struct("<IBBH")            # 8 B
 DIRENT_MIN = 8
 
-TYPE_FILE, TYPE_DIR = 1, 2
+TYPE_FILE, TYPE_DIR, TYPE_SYMLINK = 1, 2, 3
 
 # journal（见 docs/kifs.md §8）
 JRN_MAGIC = b"KJRN"
@@ -953,6 +957,56 @@ class Image(object):
         self.write_record(parent)
         return oid
 
+    def symlink(self, path, target, perm=PERM_SYMLINK_DEFAULT):
+        """创建符号链接（type=3）：内容为目标路径的 UTF-8 字节，允许 dangling。"""
+        if not isinstance(target, str):
+            raise SystemExit("符号链接目标必须是字符串")
+        try:
+            data = target.encode("utf-8")
+        except UnicodeEncodeError:
+            raise SystemExit("符号链接目标不是合法 UTF-8 字符串: %s" % path)
+        if b"\x00" in data:
+            raise SystemExit("符号链接目标不能包含 NUL: %s" % path)
+        if not data:
+            raise SystemExit("符号链接目标不能为空: %s" % path)
+        if len(data) > SYMLINK_TARGET_MAX:
+            raise SystemExit("符号链接目标太长: %d 字节（上限 %d 字节）"
+                             % (len(data), SYMLINK_TARGET_MAX))
+        parent_oid, name = self.resolve(path)
+        if not name:
+            raise SystemExit("不能创建根 /")
+        parent = self.read_record(parent_oid)
+        if self.dir_lookup(parent, name) is not None:
+            raise SystemExit("已存在: %s" % path)
+        now = int(time.time())
+        oid = self.alloc_oid()
+        r = Record()
+        r.oid, r.type, r.perm = oid, TYPE_SYMLINK, perm
+        r.parent, r.ctime, r.mtime = parent_oid, now, now
+        r.owner = default_owner().encode()
+        self.write_record(r)
+        self.write_content(r, data)
+        self.write_record(r)
+        self.dir_add(parent, name, oid, TYPE_SYMLINK)
+        self.write_record(parent)
+        return oid
+
+    def readlink(self, path):
+        """读取符号链接目标（不跟随链接；目标可以不存在）。"""
+        parent_oid, name = self.resolve(path)
+        parent = self.read_record(parent_oid)
+        oid = self.dir_lookup(parent, name) if name else None
+        if oid is None:
+            raise SystemExit("找不到: %s" % path)
+        rec = self.read_record(oid)
+        if rec.type != TYPE_SYMLINK:
+            raise SystemExit("不是符号链接: %s" % path)
+        data = self.read_content(rec)
+        try:
+            return data.decode("utf-8")
+        except UnicodeDecodeError:
+            raise SystemExit("符号链接目标不是合法 UTF-8: %s" % path)
+
     def write_file(self, path, data, perm=None):
         parent_oid, name = self.resolve(path)
         if not name:
@@ -962,6 +1016,8 @@ class Image(object):
         now = int(time.time())
         if oid is not None:
             rec = self.read_record(oid)
+            if rec.type == TYPE_SYMLINK:
+                raise SystemExit("是符号链接: %s" % path)
             if rec.type != TYPE_FILE:
                 raise SystemExit("目标是目录: %s" % path)
             if rec.perm & PERM_RO:
@@ -992,6 +1048,8 @@ class Image(object):
         if oid is None:
             raise SystemExit("找不到: %s" % path)
         rec = self.read_record(oid)
+        if rec.type == TYPE_SYMLINK:
+            raise SystemExit("是符号链接: %s" % path)
         if rec.type != TYPE_FILE:
             raise SystemExit("是目录: %s" % path)
         return self.read_content(rec)
@@ -1706,6 +1764,21 @@ def cmd_read(args):
     return 0
 
 
+def cmd_symlink(args):
+    img = open_img(args)
+    perm = parse_perm(args.perm) if args.perm else PERM_SYMLINK_DEFAULT
+    img.symlink(args.path, args.target, perm=perm)
+    img.flush()
+    print("✅ symlink %s -> %s" % (args.path, args.target))
+    return 0
+
+
+def cmd_readlink(args):
+    img = open_img(args)
+    print(img.readlink(args.path))
+    return 0
+
+
 def cmd_ls(args):
     img = open_img(args)
     path = args.path or "/"
@@ -1727,10 +1800,14 @@ def cmd_ls(args):
         if rec is None:
             print("❌ %s → 坏 record %d" % (n, oid))
             continue
-        kind = "d" if rec.type == TYPE_DIR else "-"
+        kind = {TYPE_DIR: "d", TYPE_FILE: "-", TYPE_SYMLINK: "l"}.get(rec.type, "?")
         show = n if not (rec.perm & PERM_HIDE) else "." + n
-        print("%s %s %-8s %s" % (kind, perm_str(rec.perm) + rec.owner.decode("utf-8", "replace"),
-                                 str(rec.size) if rec.type == TYPE_FILE else "dir", show))
+        size = "dir" if rec.type == TYPE_DIR else str(rec.size)
+        line = "%s %s %-8s %s" % (kind, perm_str(rec.perm) + rec.owner.decode("utf-8", "replace"),
+                                  size, show)
+        if rec.type == TYPE_SYMLINK:
+            line += " -> %s" % img.read_content(rec).decode("utf-8", "replace")
+        print(line)
     return 0
 
 
@@ -1743,7 +1820,10 @@ def cmd_stat(args):
         raise SystemExit("找不到: %s" % args.path)
     rec = img.read_record(oid)
     print("oid        : %d" % rec.oid)
-    print("type       : %s" % ("dir" if rec.type == TYPE_DIR else "file"))
+    typ_name = {TYPE_DIR: "dir", TYPE_FILE: "file", TYPE_SYMLINK: "symlink"}.get(rec.type, "unknown")
+    print("type       : %s" % typ_name)
+    if rec.type == TYPE_SYMLINK:
+        print("target     : %s" % img.read_content(rec).decode("utf-8", "replace"))
     print("perm       : %s%s" % (perm_str(rec.perm), rec.owner.decode("utf-8", "replace")))
     print("size       : %d 字节" % rec.size)
     print("blocks     : %d" % rec.blocks)
@@ -1792,6 +1872,7 @@ def cmd_fsck(args):
     used = {}
     owner = {}
     claimed = [0]           # extent 占用的数据块数（含 ext_index 表）
+    nsym = 0                # 符号链接数（type=3）
 
     def bad(msg):
         problems.append(msg)
@@ -1873,7 +1954,7 @@ def cmd_fsck(args):
             rec = Record.unpack(raw[base:base + RECORD_SIZE])
             o = oid + i
             owner[o] = rec
-            if rec.type not in (TYPE_FILE, TYPE_DIR):
+            if rec.type not in (TYPE_FILE, TYPE_DIR, TYPE_SYMLINK):
                 bad("oid %d 未知类型 %d" % (o, rec.type))
                 continue
             if rec.oid != o:
@@ -1922,6 +2003,22 @@ def cmd_fsck(args):
                         bad("oid %d ext_index=%d+%d 越界" % (o, rec.ext_index, nidx))
                     else:
                         take(rec.ext_index, "oid %d ext_index" % o, nidx)
+            if rec.type == TYPE_SYMLINK:
+                nsym += 1
+                if rec.size > SYMLINK_TARGET_MAX:
+                    bad("oid %d 符号链接目标 %d 字节 > 上限 %d" %
+                        (o, rec.size, SYMLINK_TARGET_MAX))
+                try:
+                    data = img.read_content(rec)
+                except Exception as e:
+                    bad("oid %d 符号链接目标读取失败: %s" % (o, e))
+                    data = b""
+                if b"\x00" in data:
+                    bad("oid %d 符号链接目标含 NUL" % o)
+                try:
+                    data.decode("utf-8")
+                except UnicodeDecodeError:
+                    bad("oid %d 符号链接目标不是合法 UTF-8" % o)
             if rec.parent:
                 p = img.read_record(rec.parent)
                 if p is None or p.type != TYPE_DIR:
@@ -2011,10 +2108,10 @@ def cmd_fsck(args):
         if o not in seen:
             bad("oid %d 未被任何目录项引用（孤立）" % o)
 
-    return _fsck_report(problems, len(owner), len(used), real_free)
+    return _fsck_report(problems, len(owner), len(used), real_free, nsym)
 
 
-def _fsck_report(problems, nrec, nused, free):
+def _fsck_report(problems, nrec, nused, free, nsym=0):
     if problems:
         print("❌ fsck 发现 %d 个问题:" % len(problems))
         for p in problems[:50]:
@@ -2022,7 +2119,9 @@ def _fsck_report(problems, nrec, nused, free):
         if len(problems) > 50:
             print("   ...（其余 %d 项省略）" % (len(problems) - 50))
         return 1
-    print("✅ fsck 通过: %d 个 record, %d 个块在用, 空闲 %d 块" % (nrec, nused, free))
+    sym_txt = ("（其中 %d 个符号链接）" % nsym) if nsym else ""
+    print("✅ fsck 通过: %d 个 record%s, %d 个块在用, 空闲 %d 块"
+          % (nrec, sym_txt, nused, free))
     return 0
 
 
@@ -2082,6 +2181,13 @@ def main():
 
     p = sub.add_parser("read"); p.add_argument("img"); p.add_argument("path")
     p.add_argument("--out", default=None); add_offset_args(p); p.set_defaults(func=cmd_read)
+
+    p = sub.add_parser("symlink"); p.add_argument("img"); p.add_argument("path")
+    p.add_argument("--target", required=True, help="链接指向的目标路径（不解析是否存在）")
+    p.add_argument("--perm", default=None); add_offset_args(p); p.set_defaults(func=cmd_symlink)
+
+    p = sub.add_parser("readlink"); p.add_argument("img"); p.add_argument("path")
+    add_offset_args(p); p.set_defaults(func=cmd_readlink)
 
     p = sub.add_parser("ls"); p.add_argument("img"); p.add_argument("path", nargs="?", default=None)
     add_offset_args(p); p.set_defaults(func=cmd_ls)

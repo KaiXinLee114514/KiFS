@@ -152,6 +152,15 @@ class KifsFS(Operations):
     def _need_dir(self, path):
         return self._need(path, mkifs.TYPE_DIR)
 
+    def _need_file(self, path):
+        """文件操作专用：符号链接不给当普通文件读写（EINVAL），目录 EISDIR。"""
+        rec = self._need(path)
+        if rec.type == mkifs.TYPE_SYMLINK:
+            raise FuseOSError(errno.EINVAL)
+        if rec.type != mkifs.TYPE_FILE:
+            raise FuseOSError(errno.EISDIR)
+        return rec
+
     def _check_ro(self):
         if self.read_only:
             raise FuseOSError(errno.EROFS)
@@ -177,6 +186,21 @@ class KifsFS(Operations):
             raise FuseOSError(errno.EACCES)
 
     def _attrs(self, rec):
+        if rec.type == mkifs.TYPE_SYMLINK:
+            # 符号链接的权限位恒为 0777（Linux 忽略其实际权限，不随只读挂载降级）
+            return {
+                "st_mode": stat.S_IFLNK | 0o777,
+                "st_nlink": 1,
+                "st_size": rec.size,          # 目标路径的字节数
+                "st_uid": self.uid,
+                "st_gid": self.gid,
+                "st_ino": rec.oid,
+                "st_atime": float(rec.mtime),
+                "st_mtime": float(rec.mtime),
+                "st_ctime": float(rec.ctime or rec.mtime),
+                "st_blocks": 0,
+                "st_blksize": self.bs,
+            }
         isdir = rec.type == mkifs.TYPE_DIR
         mode = (stat.S_IFDIR if isdir else stat.S_IFREG) | perm_to_mode(rec.perm)
         if self.read_only:
@@ -248,7 +272,12 @@ class KifsFS(Operations):
                 continue
             if not self.allow_hidden and (child.perm & mkifs.PERM_HIDE):
                 continue
-            names.append(name)
+            if child.type == mkifs.TYPE_SYMLINK:
+                # 带 attrs 的项才能让内核拿到 DT_LNK（ls -F/ls -l 首字符为 l）
+                names.append((name, {"st_mode": stat.S_IFLNK | 0o777,
+                                     "st_ino": oid}, 0))
+            else:
+                names.append(name)
         return names
 
     @_locked
@@ -288,7 +317,7 @@ class KifsFS(Operations):
     # ------------------------------------------------------------------
     @_locked
     def open(self, path, flags):
-        rec = self._need(path, mkifs.TYPE_FILE)
+        rec = self._need_file(path)
         if (flags & os.O_ACCMODE) != os.O_RDONLY:
             self._check_write(rec)
         else:
@@ -311,13 +340,13 @@ class KifsFS(Operations):
 
     @_locked
     def read(self, path, size, offset, fh):
-        rec = self._need(path, mkifs.TYPE_FILE)
+        rec = self._need_file(path)
         self._check_read(rec)
         return self.img.read_at(rec, offset, size)
 
     @_locked
     def write(self, path, data, offset, fh):
-        rec = self._need(path, mkifs.TYPE_FILE)
+        rec = self._need_file(path)
         self._check_write(rec)
         self.img.write_at(rec, offset, data)
         rec.mtime = int(time.time())
@@ -327,7 +356,7 @@ class KifsFS(Operations):
 
     @_locked
     def truncate(self, path, length, fh=None):
-        rec = self._need(path, mkifs.TYPE_FILE)
+        rec = self._need_file(path)
         self._check_write(rec)
         self.img.truncate_at(rec, length)
         rec.mtime = int(time.time())
@@ -402,11 +431,34 @@ class KifsFS(Operations):
 
     @_locked
     def readlink(self, path):
-        raise FuseOSError(errno.EINVAL)
+        rec = self._need(path)
+        if rec.type != mkifs.TYPE_SYMLINK:
+            raise FuseOSError(errno.EINVAL)
+        data = self.img.read_content(rec)
+        try:
+            return data.decode("utf-8")
+        except UnicodeDecodeError:
+            raise FuseOSError(errno.EIO)
 
     @_locked
     def symlink(self, target, source):
-        raise FuseOSError(errno.EOPNOTSUPP)
+        # fusepy 的参数顺序：target=新链接路径，source=链接指向的目标路径
+        # （底层 C: symlink(source, target)，见 fusepy Operations.symlink 文档）
+        try:
+            tlen = len(source.encode("utf-8"))
+        except UnicodeEncodeError:
+            raise FuseOSError(errno.EINVAL)
+        if not source:
+            raise FuseOSError(errno.ENOENT)
+        if tlen > mkifs.SYMLINK_TARGET_MAX:
+            raise FuseOSError(errno.ENAMETOOLONG)
+        parent, name = self.img.parent_record(target)
+        self._check_dir_write(parent)
+        if self.img.dir_lookup(parent, name) is not None:
+            raise FuseOSError(errno.EEXIST)
+        self.img.symlink(target, source)
+        self._flush()
+        return 0
 
     @_locked
     def getxattr(self, path, name, position=0):

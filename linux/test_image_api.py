@@ -203,6 +203,23 @@ def one_image(tmp, bs, size_mib):
         check(True, "文件下取路径返回 ENOTDIR")
     check(img.record_at("/nope") is None, "不存在的路径返回 None")
 
+    # --- 符号链接（type=3）：内联目标 + 长目标走 extent ---
+    sym_target = "/目标-🙂"
+    img.symlink("/link", sym_target)
+    lrec = img.record_at("/link")
+    check(lrec.type == mkifs.TYPE_SYMLINK and img.readlink("/link") == sym_target,
+          "symlink 创建 + readlink 往返（%d 字节目标）" % len(sym_target.encode()))
+    check(lrec.inline_len == len(sym_target.encode()) and lrec.blocks == 0,
+          "短符号链接目标内联存储")
+    long_target = "/" + "x" * 299
+    img.symlink("/longlink", long_target)
+    lrec2 = img.record_at("/longlink")
+    check(lrec2.inline_len == 0 and lrec2.blocks >= 1
+          and img.read_content(lrec2) == long_target.encode(),
+          "长符号链接目标走 extent，块级读取字节一致")
+    img.symlink("/dangling", "/does/not/exist")
+    check(img.readlink("/dangling") == "/does/not/exist", "dangling 目标 readlink 正常")
+
     info = img.statfs_info()
     check(info["blocks"] > 0 and info["free_blocks"] >= 0, "statfs_info 字段")
     img.write_record(rec)

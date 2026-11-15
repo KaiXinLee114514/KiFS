@@ -244,6 +244,72 @@ def case_meta(d):
     run("fsck", bad5, expect=1)
 
 
+def case_symlink(d):
+    """type=3 符号链接：创建/readlink/ls/stat/当文件读写报错/1024B 上限/dangling。"""
+    tag = "symlink"
+    img = os.path.join(d, "sym.img")
+    run("format", img, "--size-mib", "4")
+    run("mkdir", img, "/dir")
+    run("write", img, "/dir/target.txt", "--data", "hello symlink")
+
+    # 短目标（中文 + emoji）内联存储
+    target = "/dir/目标-🙂.txt"
+    run("symlink", img, "/link", "--target", target)
+    r = run("readlink", img, "/link")
+    check(r.stdout.strip() == target, f"{tag} readlink 往返一致（中文/emoji）")
+    r = run("stat", img, "/link")
+    check("type       : symlink" in r.stdout, f"{tag} stat type=symlink")
+    check("target     : %s" % target in r.stdout, f"{tag} stat 显示 target")
+    check("size       : %d 字节" % len(target.encode()) in r.stdout,
+          f"{tag} stat size=目标字节数")
+    check("inline_len : %d" % len(target.encode()) in r.stdout, f"{tag} 短目标走 inline")
+
+    # ls：类型前缀 l + " -> target"
+    r = run("ls", img, "/")
+    line = [l for l in r.stdout.splitlines() if l.endswith(" link -> %s" % target)]
+    check(bool(line) and line[0].startswith("l "), f"{tag} ls 显示 l 前缀与 -> target")
+
+    # dangling：目标不存在也合法
+    run("symlink", img, "/dangling", "--target", "/no/such/file")
+    r = run("readlink", img, "/dangling")
+    check(r.stdout.strip() == "/no/such/file", f"{tag} dangling 链接 readlink 正常")
+
+    # 指向目录
+    run("symlink", img, "/dirlink", "--target", "/dir")
+    r = run("readlink", img, "/dirlink")
+    check(r.stdout.strip() == "/dir", f"{tag} 指向目录的链接 readlink")
+
+    # 当普通文件读写 → 明确报错
+    r = run("read", img, "/link", expect=1)
+    check("符号链接" in (r.stdout + r.stderr), f"{tag} read 符号链接报错")
+    r = run("write", img, "/link", "--data", "x", expect=1)
+    check("符号链接" in (r.stdout + r.stderr), f"{tag} write 符号链接报错")
+
+    # 目标长度上限：1024 B 允许（走 extent），1025 B 拒绝
+    long_ok = "/" + "a" * 1023
+    run("symlink", img, "/long-ok", "--target", long_ok)
+    r = run("stat", img, "/long-ok")
+    check("blocks     : 1" in r.stdout and "inline_len : 0" in r.stdout,
+          f"{tag} 1024B 目标走 extent")
+    long_bad = "/" + "b" * 1024
+    r = run("symlink", img, "/long-bad", "--target", long_bad, expect=1)
+    check("太长" in (r.stdout + r.stderr), f"{tag} 1025B 目标被拒绝")
+
+    # 同名拒绝
+    r = run("symlink", img, "/link", "--target", "/x", expect=1)
+    check("已存在" in (r.stdout + r.stderr), f"{tag} 重名 symlink 被拒绝")
+
+    # unlink 只删链接，不动目标
+    run("rm", img, "/link")
+    run("readlink", img, "/link", expect=1)
+    out = os.path.join(d, "sym-target.out")
+    run("read", img, "/dir/target.txt", "--out", out)
+    check(open(out, "rb").read() == b"hello symlink", f"{tag} 删除链接后目标文件不受影响")
+
+    r = run("fsck", img)
+    check("符号链接" in r.stdout, f"{tag} fsck 通过并报告符号链接数量")
+
+
 def main():
     d = tempfile.mkdtemp(prefix="kifs-v2-test-")
     try:
@@ -251,6 +317,7 @@ def main():
             case_block_size(d, bs, mib)
         case_big_16k(d)
         case_meta(d)
+        case_symlink(d)
         print(f"\n🎉 全部 {T} 项自测通过（4 KiB + 16 KiB）")
     finally:
         shutil.rmtree(d, ignore_errors=True)

@@ -351,6 +351,59 @@ PYEOF
     fsck_img "$img"
 }
 
+# ---------------------------------------------------------------- 符号链接（type=3）
+test_symlink() {
+    local img="$TMP/sym.img" mnt="$TMP/sym.mnt" long_t line got
+    log "=== [符号链接] ==="
+    "${MKIFS[@]}" format "$img" --size-mib 4 >/dev/null || die "format 失败"
+    "${MKIFS[@]}" mkdir "$img" /dir >/dev/null || die "mkdir /dir 失败"
+    "${MKIFS[@]}" write "$img" /dir/target.txt --data "link target content" >/dev/null \
+        || die "写 /dir/target.txt 失败"
+    long_t="/$(printf 'z%.0s' $(seq 1 199))"
+
+    mount_kifs "$img" "$mnt" || die "挂载失败"
+    ln -s target.txt "$mnt/dir/link" || die "ln -s 相对链接失败"
+    ln -s /dir "$mnt/dir/dirlink" || die "ln -s 目录链接失败"
+    ln -s /nonexistent/x "$mnt/dir/dangling" || die "ln -s dangling 失败"
+    ln -s "$long_t" "$mnt/dir/longlink" || die "ln -s 长目标失败"
+    [ "$(readlink "$mnt/dir/link")" = "target.txt" ] || die "readlink 结果不对"
+    ok "ln -s + readlink"
+    [ "$(cat "$mnt/dir/link")" = "link target content" ] || die "cat 跟随链接读目标失败"
+    ok "cat 链接（跟随读到目标内容）"
+    line=$(ls -l "$mnt/dir" | grep ' link -> target\.txt$') || die "ls -l 未显示 link -> target.txt"
+    case "$line" in
+        l*) ;;
+        *) die "ls -l 首字符不是 l: $line" ;;
+    esac
+    ok "ls -l 显示 l 前缀 + -> target"
+    [ "$(stat -c '%F' "$mnt/dir/link")" = "symbolic link" ] || die "stat -c %F 不是 symbolic link"
+    [ "$(stat -c '%a' "$mnt/dir/link")" = "777" ] || die "符号链接 mode 不是 777"
+    ok "stat: symbolic link / mode 777"
+    [ "$(readlink "$mnt/dir/dangling")" = "/nonexistent/x" ] || die "dangling readlink 失败"
+    cat "$mnt/dir/dangling" 2>/dev/null && die "dangling 链接居然能 cat"
+    ok "dangling：readlink 正常，cat 报 ENOENT"
+    [ "$(ls "$mnt/dir/dirlink/")" = "target.txt" ] || die "目录链接 ls 失败"
+    ok "目录链接：ls link/ 正常"
+    [ "$(readlink "$mnt/dir/longlink")" = "$long_t" ] || die "长目标 readlink 不一致"
+    ok "长目标（200B）readlink"
+    rm "$mnt/dir/link" || die "unlink 符号链接失败"
+    [ ! -e "$mnt/dir/link" ] || die "unlink 后链接仍存在"
+    ok "unlink 符号链接"
+    unmount_kifs "$mnt" || die "卸载失败"
+
+    fsck_img "$img"
+    got=$("${MKIFS[@]}" readlink "$img" /dir/longlink) || die "离线 readlink 失败"
+    [ "$got" = "$long_t" ] || die "离线 readlink 不一致"
+    "${MKIFS[@]}" stat "$img" /dir/longlink | grep -q 'type       : symlink' \
+        || die "离线 stat type 不是 symlink"
+    "${MKIFS[@]}" stat "$img" /dir/longlink | grep -q 'blocks     : 1' \
+        || die "离线 stat 长目标未走 extent"
+    "${MKIFS[@]}" ls "$img" /dir | grep -q 'l .* longlink -> ' \
+        || die "离线 ls 未显示 l / -> target"
+    ok "离线 readlink/stat/ls"
+    fsck_img "$img"
+}
+
 # ---------------------------------------------------------------- 带 hide/ro 位的文件
 test_perm_flags() {
     local img="$TMP/perm.img" mnt="$TMP/perm.mnt"
@@ -441,6 +494,7 @@ log "临时目录: $TMP"
 test_image 4096 4 4k4m
 test_image 16384 64 16k64m
 test_perm_flags
+test_symlink
 test_offset
 test_offset_lba
 test_loop_device
