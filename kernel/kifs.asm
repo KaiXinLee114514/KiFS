@@ -1264,6 +1264,54 @@ kifs_write_block:
     ret
 
 ; ---------------------------------------------------------------------------
+;  kifs_bm_load:eax = 位图块序号(0 基) → eax = 0/-1
+;  按需换入位图块;若当前缓存的位图块有未提交改动,先把整块作为 delta 记入事务。
+;  位图块数由 superblock 推导(record_start - data_start),大卷可跨多块。
+; ---------------------------------------------------------------------------
+kifs_bm_load:
+    pushad
+    mov [kifs_bl_req], eax
+    mov ecx, [kifs_bm_cur_idx]
+    cmp eax, ecx
+    je .ok
+    ; ---- 换出:当前缓存块脏 → 整块 delta ----
+    cmp ecx, -1
+    je .load
+    cmp byte [kifs_bitmap_dirty], 0
+    je .load
+    mov eax, [kifs_data_start]
+    add eax, ecx
+    mov ecx, [kifs_block_size]
+    mov esi, KIFS_BITMAP_BUF
+    call kifs_delta_add_block
+    test eax, eax
+    jnz .fail
+.load:
+    mov eax, [kifs_bl_req]
+    add eax, [kifs_data_start]
+    call kifs_read_block
+    test eax, eax
+    jnz .fail
+    mov esi, KIFS_IO_BUF
+    mov edi, KIFS_BITMAP_BUF
+    mov ecx, [kifs_block_size]
+    shr ecx, 2
+    cld
+    rep movsd
+    mov eax, [kifs_bl_req]
+    mov [kifs_bm_cur_idx], eax
+    mov byte [kifs_bitmap_dirty], 0
+.ok:
+    mov dword [kifs_bl_ret], 0
+    jmp .out
+.fail:
+    mov dword [kifs_bl_ret], -1
+.out:
+    popad
+    mov eax, [kifs_bl_ret]
+    ret
+
+; ---------------------------------------------------------------------------
 ;  kifs_crc16:esi = 数据,ecx = 长度 → eax = CRC16-CCITT(poly 0x1021,初值 0xFFFF)
 ;  与宿主 mkifs.py 的 crc16 逐位一致;空数据 = 0xFFFF。保留所有寄存器。
 ; ---------------------------------------------------------------------------
@@ -1304,36 +1352,63 @@ kifs_crc16:
     ret
 
 ; ---------------------------------------------------------------------------
-;  位图缓存(KIFS_BITMAP_BUF):eax = 块号 → eax = 0 / 1
+;  位图缓存(KIFS_BITMAP_BUF):eax = 块号 → eax = 0/1(失败 -1)
+;  块号 → 位图块序号 = block >> (block_shift+3),块内位号 = block & (block_size*8-1)
 ; ---------------------------------------------------------------------------
 kifs_bit_get:
-    push ecx
-    push edx
+    pushad
+    mov [kifs_bg_block], eax
+    mov ecx, [kifs_block_shift]
+    add ecx, 12          ; 每块位图描述 block_size*8 = 4096<<block_shift 个数据块
+    shr eax, cl
+    call kifs_bm_load
+    test eax, eax
+    jnz .fail
+    mov edx, [kifs_block_size]
+    shl edx, 3
+    dec edx
+    mov eax, [kifs_bg_block]
+    and eax, edx
     mov ecx, eax
     shr eax, 3
-    and ecx, 7
     movzx edx, byte [KIFS_BITMAP_BUF + eax]
+    and ecx, 7
     shr edx, cl
-    mov eax, edx
-    and eax, 1
-    pop edx
-    pop ecx
+    and edx, 1
+    mov [kifs_bg_ret], edx
+    jmp .out
+.fail:
+    mov dword [kifs_bg_ret], -1
+.out:
+    popad
+    mov eax, [kifs_bg_ret]
     ret
 
 ; ---------------------------------------------------------------------------
-;  kifs_bit_set:eax = 块号,edx = 0/1;改内存位图并置 dirty 标记
-;  (整块位图在 flush 时作为一个 4096 B delta 落盘,所以只要一个 dirty 位)
+;  kifs_bit_set:eax = 块号,edx = 0/1 → eax = 0/-1
+;  改动留在内存位图块里,flush 时整块作为一个 delta 落盘(多块位图按块换入换出)
 ; ---------------------------------------------------------------------------
 kifs_bit_set:
-    push ebx
-    push ecx
-    mov ebx, eax
-    and ebx, 7
+    pushad
+    mov [kifs_bs_block], eax
+    mov [kifs_bs_val], edx
+    mov ecx, [kifs_block_shift]
+    add ecx, 12          ; 每块位图描述 block_size*8 = 4096<<block_shift 个数据块
+    shr eax, cl
+    call kifs_bm_load
+    test eax, eax
+    jnz .fail
+    mov edx, [kifs_block_size]
+    shl edx, 3
+    dec edx
+    mov eax, [kifs_bs_block]
+    and eax, edx
+    mov ecx, eax
     shr eax, 3
-    mov ecx, ebx
+    and ecx, 7
     mov bl, 1
     shl bl, cl
-    cmp edx, 0
+    cmp dword [kifs_bs_val], 0
     je .clear
     or [KIFS_BITMAP_BUF + eax], bl
     jmp .mark
@@ -1342,8 +1417,13 @@ kifs_bit_set:
     and [KIFS_BITMAP_BUF + eax], bl
 .mark:
     mov byte [kifs_bitmap_dirty], 1
-    pop ecx
-    pop ebx
+    mov dword [kifs_bs_ret], 0
+    jmp .out
+.fail:
+    mov dword [kifs_bs_ret], -1
+.out:
+    popad
+    mov eax, [kifs_bs_ret]
     ret
 
 ; ---------------------------------------------------------------------------
@@ -2274,7 +2354,8 @@ kifs_flush:
 .sb_same:
     cmp byte [kifs_bitmap_dirty], 0
     je .no_bitmap
-    mov eax, [kifs_data_start]
+    mov eax, [kifs_bm_cur_idx]
+    add eax, [kifs_data_start]
     mov ecx, [kifs_block_size]
     mov esi, KIFS_BITMAP_BUF
     call kifs_delta_add_block
@@ -2364,9 +2445,15 @@ kifs_mount_sb:
     mov eax, [KIFS_IO_BUF + 12]            ; total_blocks
     cmp eax, 8
     jb .next_bs
-    mov ecx, [kifs_block_size]
-    shl ecx, 3                             ; 单块位图最多描述 8*bs 块
-    cmp eax, ecx
+    ; 位图容量 = (record_start - data_start) 个位图块 × 每块 8*bs 位
+    mov ecx, [KIFS_IO_BUF + 40]            ; record_start
+    sub ecx, [KIFS_IO_BUF + 20]            ; = 位图块数
+    test ecx, ecx
+    jz .next_bs
+    mov edx, [kifs_block_size]
+    shl edx, 3
+    imul ecx, edx
+    cmp eax, ecx                           ; 大卷:位图可跨多块
     ja .next_bs
     mov [kifs_total_blocks], eax
     mov ebx, [KIFS_IO_BUF + 40]            ; record_start
@@ -2464,17 +2551,12 @@ kifs_mount_sb:
     mov edi, KIFS_SB_OLD
     mov ecx, 112
     rep movsb
-    ; ---- 位图块 → BITMAP_BUF ----
-    mov eax, [kifs_data_start]
-    call kifs_read_block
+    ; ---- 位图:加载第一块(后续按需换入) ----
+    mov dword [kifs_bm_cur_idx], -1
+    xor eax, eax
+    call kifs_bm_load
     test eax, eax
     jnz .out
-    mov esi, KIFS_IO_BUF
-    mov edi, KIFS_BITMAP_BUF
-    mov ecx, [kifs_block_size]
-    shr ecx, 2
-    cld
-    rep movsd
     mov dword [kifs_ms_ret], 0
     jmp .out
 .next_bs:
@@ -3604,6 +3686,14 @@ kifs_meta_next       dd 0
 kifs_journal_start   dd 0
 kifs_journal_blocks  dd 0
 kifs_bitmap_dirty    db 0
+kifs_bm_cur_idx      dd -1          ; 当前缓存的位图块序号(-1 = 未加载)
+kifs_bg_block        dd 0
+kifs_bg_ret          dd 0
+kifs_bs_block        dd 0
+kifs_bs_val          dd 0
+kifs_bs_ret          dd 0
+kifs_bl_req          dd 0
+kifs_bl_ret          dd 0
 
 kifs_delta_n         dd 0
 kifs_das_ret         dd 0
