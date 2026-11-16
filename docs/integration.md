@@ -62,8 +62,9 @@ dd if=/tmp/kifs-part.img of=build/hd.img bs=512 seek=22528 conv=notrunc
 
 大卷（LBA48 测试）示例：`-DKIFS_PART_LBA=300000000` 编译内核，把卷 `dd` 到
 200 GiB 稀疏盘的 300000000 号扇区（>128 GiB，32 位 LBA 必溢出，只能走 LBA48）。
-注意内核位图缓存只有一块，单卷最多 `8*block_size` 个块（4K→128 MiB，16K→2 GiB）；
-更大的卷需要先实现多块位图。
+内核位图**按需分块换入**：每块位图管理 `8*block_size` 个数据块（4K→32768 块，16K→131072 块），
+`kifs_bm_load` 在跨位图块访问时换入缓存并记 journal delta，单卷上限由位图可用块数决定
+（`(record_start - data_start) * block_size * 8` 个块），4K/16K 大卷不再受单块位图限制。
 
 **B. 内核自己写**：卷是空的也行——`kifs_init` 需要合法 superblock，可先用宿主 format 一次，之后内核侧的
 `kifs mkdir/write/rm` 会走 journal+CoW 自行维护。

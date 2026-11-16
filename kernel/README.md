@@ -16,9 +16,10 @@ KKernel 的 `kifs-v2` 分支已用它通过 4 KiB / 16 KiB / LBA48 高地址三�
 - 与 FAT16 各读各的分区，互不影响；KiFS 卷由宿主工具 [`tools/mkifs.py`](../tools/mkifs.py) 或内核自身写入。
 - 依赖宿主内核提供：ATA PIO 读写（含 LBA48 版本）、shell 命令表/打印、管道 stdin。
 
-> 限制：位图缓存目前只装 **一个块**，因此单卷最多 `8 * block_size` 个块
-> （4 KiB → 32768 块/128 MiB；16 KiB → 131072 块/2 GiB）。更大的卷要改成多块位图，
-> 当前未实现（宿主工具能格式化，内核会拒绝挂载）。
+> 位图**按需分块换入**（多块位图）：每块位图管理 `8 * block_size` 个数据块
+> （4 KiB → 32768 块/128 MiB；16 KiB → 131072 块/2 GiB），`kifs_bm_load` 在访问跨块位图时
+> 换入缓存并记 journal delta。单卷上限由位图可用块数决定（`(record_start - data_start) * block_size * 8`
+> 个数据块），4K/16K 大卷均可挂载（宿主 `mkifs.py` 能格式化出任意大小直到 64 TiB 上限）。
 
 ## 命令行
 
@@ -100,7 +101,7 @@ kifs journal
 - `kifs_now` 恒 0：新建/修改文件的 ctime/mtime 写 0（宿主 fsck 不检查）。
 - `kifs write <path> <text>` 的文本参数受内核 shell 行缓冲 128 字符限制；大文件请用管道 stdin。
 - journal 64 槽环形复用，与宿主 mkifs.py 行为一致。
-- 单块位图限制（见上）。
+- 位图缓存按需换入（多块位图），不再有单块位图上限；见上文说明。
 - **符号链接（type=3）**：本期未改内核驱动，宿主工具/FUSE 已支持（见
   [docs/kifs.md](../docs/kifs.md) §6.1）。参考驱动遇到 type=3 时的显示行为：
   `kifs ls` 把链接当普通项显示 `-`（不显示 `-> target`）、大小显示目标字节数；
